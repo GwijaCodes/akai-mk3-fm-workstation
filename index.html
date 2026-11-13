@@ -250,7 +250,9 @@ input[type="range"]::-moz-range-thumb {
 .pages { display: flex; gap: 4px; align-items: stretch; }
 .page-btn { flex: 1; padding: 5px 4px; background: var(--display); color: var(--amber-dim); font-family: var(--font-mono); font-size: 10px; }
 .page-btn.on { border-color: #5a3d10; color: var(--amber); text-shadow: 0 0 6px var(--amber-glow); }
-.page-btn.learning { border-color: var(--accent); color: #fff; animation: blink 0.45s infinite alternate; }
+.learn-target { outline: 2px solid var(--accent); outline-offset: -2px; animation: blink 0.45s infinite alternate; }
+.learn-mode .pad, .learn-mode .knob-cell, .learn-mode .page-btn { cursor: crosshair; }
+.cc-learn-btn[hidden] { display: none; }
 .cc-learn-btn { padding: 5px 7px; background: #262830; color: #b8beca; font: 700 9px var(--font-mono); letter-spacing: 0.5px; }
 .cc-learn-btn.on { border-color: var(--accent); color: #ff7a6a; box-shadow: inset 0 0 6px rgba(229, 25, 55, 0.5); }
 
@@ -441,6 +443,19 @@ input[type="range"]::-moz-range-thumb {
   .key { font-size: 9px; padding-bottom: 6px; cursor: pointer; }
   .key.black { margin: 0 -8px; }
 }
+
+/* ===== Modalita' tastiera del computer ===== */
+.kb-mode .key { position: relative; }
+.kb-mode .key[data-kb]::after {
+  content: attr(data-kb); position: absolute; top: 3px; left: 0; right: 0;
+  text-align: center; font-size: 8px; font-weight: 800; color: var(--amber, #ffb02e); opacity: 0.85;
+}
+.kb-mode .key.black[data-kb]::after { color: #8a5a00; }
+.kb-mode .pad[data-kb]::before {
+  content: attr(data-kb); position: absolute; top: 3px; left: 5px; z-index: 1;
+  font: 700 8px var(--font-mono, monospace); color: var(--amber-dim, #6f5a2e);
+}
+.kb-mode .knob-cell.kb-sel { outline: 1px solid var(--accent, #e51937); outline-offset: -2px; }
 </style>
 </head>
 <body>
@@ -579,7 +594,9 @@ input[type="range"]::-moz-range-thumb {
   const heldNotes = new Set();
   const stepEls = new Array(16);
   const padEls = new Array(8);
-  const keyEls = new Map();
+  const keyEls = new Map();   // slot 48..72 -> elemento del tasto
+  const litKeys = new Map();  // nota suonata -> tasto acceso, cosi' si spegne anche se la finestra si sposta
+  let viewBase = 48;          // prima nota mostrata dalla tastiera a schermo
   let isEraseHeld = false, didLiveErase = false, eraseHoldTimer = null;
   let isKnobDragging = false, saveDirty = false;
   let nextNoteTime = 0, lookaheadTimer = null, lastDrawnStep = -1;
@@ -879,8 +896,32 @@ input[type="range"]::-moz-range-thumb {
   }
 
   function flashKey(note, on) {
-    const k = keyEls.get(note);
-    if (k) k.classList.toggle("pressed", on);
+    const k = on ? keyEls.get(note - (viewBase - 48)) : (litKeys.get(note) || keyEls.get(note - (viewBase - 48)));
+    if (!k) return;
+    k.classList.toggle("pressed", on);
+    if (on) litKeys.set(note, k); else litKeys.delete(note);
+  }
+
+  /* La tastiera a schermo e' una finestra di 25 tasti che segue le note in arrivo (ottava dell'Akai o del PC) */
+  function updateKeyLabels() {
+    keyEls.forEach((el, slot) => {
+      const n = viewBase + (slot - 48);
+      el.textContent = n % 12 === 0 ? "C" + (n / 12 - 1) : "";
+    });
+  }
+
+  function setViewBase(b) {
+    if (b === viewBase) return;
+    viewBase = b;
+    updateKeyLabels();
+    refreshKbHints();
+  }
+
+  function ensureNoteVisible(note) {
+    let b = viewBase;
+    while (note < b) b -= 12;
+    while (note > b + 24) b += 12;
+    setViewBase(b);
   }
 
   function flashPad(idx) {
@@ -1204,7 +1245,7 @@ input[type="range"]::-moz-range-thumb {
   function handleNoteOn(note, vel = 0.85, isPad = false) {
     if (isPad || activeTrk === 3) {
       const rawPad = (note >= 36 && note <= 43) ? (note - 36) : (note % 8);
-      const pIdx = rawPad ^ 4;
+      const pIdx = rawPad;
       heldPads.add(pIdx);
       tracks[3].last = pIdx;
       if (isEraseHeld && isPlaying) {
@@ -1220,7 +1261,8 @@ input[type="range"]::-moz-range-thumb {
         renderSteps(); scheduleSave();
       }
     } else {
-      const n = (activeTrk === 0 && note > 55) ? note - 12 : note;
+      ensureNoteVisible(note);
+      const n = activeTrk === 0 ? note - 12 : note;
       heldNotes.add(n);
       if (isEraseHeld && isPlaying) {
         didLiveErase = true;
@@ -1245,11 +1287,11 @@ input[type="range"]::-moz-range-thumb {
   function handleNoteOff(note, force = false, isPad = false) {
     if (isPad || activeTrk === 3) {
       const rawPad = (note >= 36 && note <= 43) ? (note - 36) : (note % 8);
-      const pIdx = rawPad ^ 4;
+      const pIdx = rawPad;
       heldPads.delete(pIdx);
       return;
     }
-    const n = (activeTrk === 0 && note > 55) ? note - 12 : note;
+    const n = activeTrk === 0 ? note - 12 : note;
     heldNotes.delete(n);
     if (!force && sustainOn) {
       if (activeVoices.has(note)) sustainedNotes.add(note);
@@ -1303,53 +1345,139 @@ input[type="range"]::-moz-range-thumb {
     knobsGrid.appendChild(cell);
   }
 
-  let tabLearnStep = -1; // -1 = off, 0..2 = waiting CC for SOUND, WAVE, PITCH
-  let customTabCc = {};
-  try { customTabCc = JSON.parse(localStorage.getItem("akai_mk3_tab_cc") || "{}"); } catch (e) {}
+  /* ===== Profili MIDI per periferica + MIDI learn =====
+     Un profilo (salvato per nome del dispositivo) associa: pads "n<canale>:<nota>" o "c<canale>:<cc>" -> pad 0..7,
+     knobs "<cc>" -> manopola K1..K8 (0..7), tabs "<cc>" -> pagina (-1 = pagina successiva).
+     Un dispositivo sconosciuto parte vuoto: tutte le note suonano il piano e i CC non assegnati vengono ignorati. */
+  const PROFILES_KEY = "akai_midi_profiles_v1";
+  let profiles = {};
+  try { profiles = JSON.parse(localStorage.getItem(PROFILES_KEY) || "{}"); } catch (e) {}
+  let learnMode = false, learnTarget = null, activeDevice = "", midiLabel = "";
+  const saveProfiles = () => { try { localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles)); } catch (e) {} };
+
+  function defaultProfile(name) {
+    const p = { pads: {}, knobs: {}, tabs: {} };
+    if (!/akai|mpk/i.test(name)) return p;
+    /* Akai MPK Mini: la fila bassa dei pad (note 36-39) corrisponde alla fila bassa della griglia, quindi ^ 4 */
+    for (let ch = 1; ch < 16; ch++) for (let n = 36; n <= 43; n++) p.pads[`n${ch}:${n}`] = (n - 36) ^ 4;
+    for (let n = 36; n <= 51; n++) p.pads[`n9:${n}`] = (n <= 43 ? n - 36 : n % 8) ^ 4;
+    for (let k = 0; k < 8; k++) { p.knobs[70 + k] = k; p.knobs[1 + k] = k; }
+    [9, 10, 11, 12].forEach(cc => { p.knobs[cc] = cc - 5; });
+    p.knobs[14] = 6; p.knobs[15] = 7;
+    for (let cc = 24; cc <= 27; cc++) p.knobs[cc] = cc - 20;
+    [[16, 17, 18, 19], [20, 21, 22, 23], [80, 81, 82, 83], [102, 103, 104, 105]]
+      .forEach(row => row.forEach((cc, i) => { p.tabs[cc] = i < 3 ? i : -1; }));
+    try {   // migra le vecchie mappe globali, poi le elimina
+      Object.assign(p.knobs, JSON.parse(localStorage.getItem("akai_mk3_cc_map") || "{}"));
+      Object.assign(p.tabs, JSON.parse(localStorage.getItem("akai_mk3_tab_cc") || "{}"));
+      localStorage.removeItem("akai_mk3_cc_map"); localStorage.removeItem("akai_mk3_tab_cc");
+    } catch (e) {}
+    return p;
+  }
+
+  function getProfile(name) {
+    if (!profiles[name]) { profiles[name] = defaultProfile(name); saveProfiles(); }
+    return profiles[name];
+  }
 
   const pageBar = document.getElementById("pageBar");
   function selectPage(i) {
     activePage = ((i % PAGES.length) + PAGES.length) % PAGES.length;
-    pageBar.querySelectorAll(".page-btn").forEach((x, j) => {
-      x.classList.toggle("on", j === activePage);
-      x.classList.toggle("learning", j === tabLearnStep);
-    });
+    pageBar.querySelectorAll(".page-btn").forEach((x, j) => x.classList.toggle("on", j === activePage));
     armPickup(false);
   }
 
   PAGES.forEach((pg, i) => {
     const b = document.createElement("button");
     b.className = "page-btn" + (i === 0 ? " on" : ""); b.textContent = pg.name;
-    b.onclick = () => {
-      if (tabLearnStep >= 0) {
-        tabLearnStep = i;
-        selectPage(activePage);
-        return;
-      }
-      selectPage(i);
-    };
+    b.onclick = () => selectPage(i);
     pageBar.appendChild(b);
   });
 
-  const ccTabBtn = document.createElement("button");
-  ccTabBtn.className = "cc-learn-btn";
-  ccTabBtn.textContent = "CC";
-  ccTabBtn.title = "Assegna 3 Pad/Tasti CC ai tab SOUND / WAVE / PITCH";
-  ccTabBtn.onclick = () => {
-    tabLearnStep = tabLearnStep >= 0 ? -1 : 0;
-    ccTabBtn.classList.toggle("on", tabLearnStep >= 0);
-    const pill = document.getElementById("midiStatus");
-    pill.textContent = tabLearnStep >= 0 ? "PREMI CC -> SOUND" : "AKAI MK3 ONLINE";
-    selectPage(activePage);
+  const learnBtn = document.createElement("button");
+  learnBtn.className = "cc-learn-btn";
+  learnBtn.textContent = "LEARN";
+  learnBtn.title = "MIDI learn: tocca un pad, una manopola o una pagina, poi premi o gira il controllo sulla periferica";
+  learnBtn.onclick = () => setLearnMode(!learnMode);
+  pageBar.appendChild(learnBtn);
+
+  const resetBtn = document.createElement("button");
+  resetBtn.className = "cc-learn-btn";
+  resetBtn.textContent = "RESET";
+  resetBtn.title = "Ripristina il profilo dell'ultima periferica usata";
+  resetBtn.hidden = true;
+  resetBtn.onclick = () => {
+    if (!activeDevice) return;
+    delete profiles[activeDevice]; getProfile(activeDevice);
+    document.getElementById("midiStatus").textContent = "PROFILO RIPRISTINATO";
+    setTimeout(refreshLearnPill, 900);
   };
-  pageBar.appendChild(ccTabBtn);
+  pageBar.appendChild(resetBtn);
+
+  const learnEl = t => t.type === "pad" ? padEls[t.idx]
+    : t.type === "knob" ? knobsGrid.querySelectorAll(".knob-cell")[t.idx]
+    : pageBar.querySelectorAll(".page-btn")[t.idx];
+
+  function refreshLearnPill() {
+    if (!learnMode) return;
+    const t = learnTarget;
+    const what = !t ? "SCEGLI" : t.type === "pad" ? `PAD ${t.idx + 1}` : t.type === "knob" ? `K${t.idx + 1}` : PAGES[t.idx].name;
+    document.getElementById("midiStatus").textContent = `LEARN · ${what}`;
+  }
+
+  function setLearnTarget(t) {
+    document.querySelectorAll(".learn-target").forEach(el => el.classList.remove("learn-target"));
+    learnTarget = t;
+    if (t) learnEl(t).classList.add("learn-target");
+    refreshLearnPill();
+  }
+
+  function setLearnMode(on) {
+    learnMode = on;
+    learnBtn.classList.toggle("on", on);
+    resetBtn.hidden = !on;
+    document.body.classList.toggle("learn-mode", on);
+    setLearnTarget(null);
+    if (!on) {
+      if (midiInputCount > 0) document.getElementById("midiStatus").textContent = midiLabel;
+      else syncInputMode();
+    }
+  }
+
+  /* In learn mode i tocchi su pad, manopole e pagine scelgono il bersaglio invece di suonare */
+  document.addEventListener("pointerdown", (e) => {
+    if (!learnMode) return;
+    const el = e.target.closest(".pad, .knob-cell, .page-btn");
+    if (!el) return;
+    e.preventDefault(); e.stopPropagation();
+    const idx = list => Array.prototype.indexOf.call(list, el);
+    if (el.classList.contains("pad")) setLearnTarget({ type: "pad", idx: Number(el.dataset.p) });
+    else if (el.classList.contains("knob-cell")) setLearnTarget({ type: "knob", idx: idx(knobsGrid.querySelectorAll(".knob-cell")) });
+    else setLearnTarget({ type: "tab", idx: idx(pageBar.querySelectorAll(".page-btn")) });
+  }, true);
+
+  /* Collega al bersaglio il messaggio in arrivo, poi passa al successivo; il messaggio continua a suonare normalmente */
+  function learnMidi(profile, cmd, ch, d1, d2) {
+    const t = learnTarget;
+    if (!t) return;
+    const isNote = cmd === 0x90 && d2 > 0, isCc = cmd === 0xB0 && d2 > 0 && d1 !== 64;
+    let map = null, key = null;
+    if (t.type === "pad" && (isNote || isCc)) { map = profile.pads; key = `${isNote ? "n" : "c"}${ch}:${d1}`; }
+    else if (t.type === "knob" && isCc) { map = profile.knobs; key = String(d1); }
+    else if (t.type === "tab" && isCc) { map = profile.tabs; key = String(d1); }
+    if (!map) return;
+    map[key] = t.idx;
+    saveProfiles();
+    const total = t.type === "tab" ? PAGES.length : 8;
+    setLearnTarget(t.idx + 1 < total ? { type: t.type, idx: t.idx + 1 } : null);
+  }
 
   window.addEventListener("keydown", (e) => {
     if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
-    if (e.key === "1") selectPage(0);
-    else if (e.key === "2") selectPage(1);
-    else if (e.key === "3") selectPage(2);
-    else if (e.key === "Tab") { e.preventDefault(); selectPage(activePage + 1); }
+    if (!kbMode && e.key === "1") selectPage(0);
+    else if (!kbMode && e.key === "2") selectPage(1);
+    else if (!kbMode && e.key === "3") selectPage(2);
+    else if (e.key === "Tab") { e.preventDefault(); selectPage((activePage + PAGES.length + (e.shiftKey ? -1 : 1)) % PAGES.length); }
   });
 
   function setKnobNormalized(kIdx, norm) {
@@ -1442,12 +1570,14 @@ input[type="range"]::-moz-range-thumb {
     if (n === 48) k.textContent = "C3";
     if (n === 60) k.textContent = "C4";
     if (n === 72) k.textContent = "C5";
+    let sounding = null;   // nota effettivamente premuta, anche se la finestra si sposta
     k.onpointerdown = (e) => {
       e.preventDefault();
       k.setPointerCapture(e.pointerId);
-      handleNoteOn(n, 0.85, false);
+      sounding = n + (viewBase - 48);
+      handleNoteOn(sounding, 0.85, false);
     };
-    const relKey = () => handleNoteOff(n, false);
+    const relKey = () => { if (sounding !== null) { handleNoteOff(sounding, false); sounding = null; } };
     k.onpointerup = relKey;
     k.onpointercancel = relKey;
     keyEls.set(n, k);
@@ -1757,108 +1887,179 @@ input[type="range"]::-moz-range-thumb {
 
   async function initMIDI() {
     const pill = document.getElementById("midiStatus");
-    if (!navigator.requestMIDIAccess) { pill.textContent = "TOUCH MODE"; return; }
+    if (!navigator.requestMIDIAccess) { pill.textContent = "TOUCH MODE"; syncInputMode(); return; }
     try {
       const midi = await navigator.requestMIDIAccess();
       const bind = () => {
-        let ok = false;
+        let ok = false, count = 0, firstName = "";
         for (let input of midi.inputs.values()) {
-          ok = true; pill.textContent = "AKAI MK3 ONLINE"; pill.classList.add("online");
+          ok = true; count++; firstName = firstName || input.name; activeDevice = activeDevice || input.name;
           input.onmidimessage = (m) => {
             const [st, d1, d2] = m.data;
+            if (st >= 0xf0) return;   // clock e messaggi di sistema
             const cmd = st & 0xf0, ch = st & 0x0f;
+            activeDevice = input.name;
+            const profile = getProfile(input.name);
+            if (learnMode) learnMidi(profile, cmd, ch, d1, d2);
 
-            if (cmd === 0x90 && d2 > 0) {
-              const isPad = (ch === 9) || (d1 >= 36 && d1 <= 43 && ch !== 0);
-              handleNoteOn(d1, d2 / 127, isPad);
-            } else if (cmd === 0x80 || (cmd === 0x90 && d2 === 0)) {
-              const isPad = (ch === 9) || (d1 >= 36 && d1 <= 43 && ch !== 0);
-              handleNoteOff(d1, false, isPad);
+            if (cmd === 0x90 || cmd === 0x80) {
+              const on = cmd === 0x90 && d2 > 0;
+              const pad = profile.pads[`n${ch}:${d1}`];
+              const note = pad !== undefined ? 36 + pad : d1;
+              if (on) handleNoteOn(note, d2 / 127, pad !== undefined);
+              else handleNoteOff(note, false, pad !== undefined);
             } else if (cmd === 0xE0) {
               const raw = ((d2 << 7) | d1) - 8192;
               joyX = raw / 8192;
               pitchBend = joyX * 2;
               updateJoystickVisual();
             } else if (cmd === 0xB0) {
-              const norm = d2 / 127;
-              if (d1 === 64) {
-                setSustain(d2 >= 64);
+              if (d1 === 64) { setSustain(d2 >= 64); return; }
+              const pad = profile.pads[`c${ch}:${d1}`];
+              if (pad !== undefined) {
+                if (d2 > 0) handleNoteOn(36 + pad, d2 / 127, true); else handleNoteOff(36 + pad, false, true);
                 return;
               }
-
-              // Tab CC Learn Mode (click [CC] next to SOUND/WAVE/PITCH, then press 3 pads in CC mode)
-              if (tabLearnStep >= 0 && d2 > 0) {
-                // Clear any previous binding of this CC
-                Object.keys(customTabCc).forEach(k => { if (Number(k) === d1) delete customTabCc[k]; });
-                customTabCc[d1] = tabLearnStep;
-                try { localStorage.setItem("akai_mk3_tab_cc", JSON.stringify(customTabCc)); } catch (e) {}
-                selectPage(tabLearnStep);
-                pill.textContent = `${PAGES[tabLearnStep].name} = CC${d1}`;
-                tabLearnStep++;
-                if (tabLearnStep >= PAGES.length) {
-                  tabLearnStep = -1;
-                  ccTabBtn.classList.remove("on");
-                  selectPage(activePage);
-                } else {
-                  selectPage(activePage);
-                  setTimeout(() => { if (tabLearnStep >= 0) pill.textContent = `PREMI CC -> ${PAGES[tabLearnStep].name}`; }, 450);
-                }
+              const tab = profile.tabs[d1];
+              if (tab !== undefined) {
+                if (d2 > 0 && !learnMode) selectPage(tab === -1 ? (activePage + 1) % PAGES.length : tab);
                 return;
               }
-
-              // Direct Tab Switching via Hardware CC (AKAI Pad CC mode: 16..19, 20..23, 80..83, 102..105, or custom learned CC)
-              let targetTab = customTabCc[d1] !== undefined ? customTabCc[d1] : -1;
-              if (targetTab === -1) {
-                if (d1 === 16 || d1 === 20 || d1 === 80 || d1 === 102) targetTab = 0;      // SOUND
-                else if (d1 === 17 || d1 === 21 || d1 === 81 || d1 === 103) targetTab = 1; // WAVE
-                else if (d1 === 18 || d1 === 22 || d1 === 82 || d1 === 104) targetTab = 2; // PITCH
-                else if (d1 === 19 || d1 === 23 || d1 === 83 || d1 === 105) targetTab = (activePage + 1) % PAGES.length; // NEXT TAB
-              }
-              if (targetTab >= 0) {
-                if (d2 > 0) {
-                  selectPage(targetTab);
-                  pill.textContent = `${PAGES[targetTab].name} · CC${d1}`;
-                }
-                return;
-              }
-
-              // Knobs K1..K8 CC Mapping
-              let kIdx = -1;
-              if (!window._customCcMap) {
-                try { window._customCcMap = JSON.parse(localStorage.getItem("akai_mk3_cc_map") || "{}"); } catch (e) { window._customCcMap = {}; }
-              }
-              if (window._customCcMap[d1] !== undefined) kIdx = window._customCcMap[d1];
-              else if (d1 >= 70 && d1 <= 77) kIdx = d1 - 70;         // Program 1: CC 70..77 -> K1..K8
-              else if (d1 >= 1 && d1 <= 8) kIdx = d1 - 1;       // Program 2: CC 1..8 -> K1..K8
-              else if (d1 >= 9 && d1 <= 12) kIdx = d1 - 5;      // Split row: CC 9..12 -> K5..K8
-              else if (d1 === 14 || d1 === 15) kIdx = d1 - 8;   // Split row K7/K8: CC 14 -> K7, CC 15 -> K8
-              else if (d1 >= 24 && d1 <= 27) kIdx = d1 - 20;    // Program 3 K5..K8: CC 24..27 -> K5..K8
-              else if (!((d1 >= 16 && d1 <= 23) || (d1 >= 80 && d1 <= 87) || (d1 >= 102 && d1 <= 109))) {
-                // Auto-assign any remaining unmapped knob CC to K7, K8, K5, K6 and save
-                const used = new Set(Object.values(window._customCcMap));
-                for (let slot of [6, 7, 4, 5]) {
-                  if (!used.has(slot)) {
-                    window._customCcMap[d1] = slot;
-                    kIdx = slot;
-                    try { localStorage.setItem("akai_mk3_cc_map", JSON.stringify(window._customCcMap)); } catch (e) {}
-                    break;
-                  }
-                }
-              }
-              if (kIdx >= 0 && kIdx < 8) {
-                pill.textContent = `K${kIdx + 1} · CC${d1}`;
-                hwKnob(kIdx, norm);
-              }
+              const k = profile.knobs[d1];
+              if (k !== undefined) hwKnob(k, d2 / 127);
             } else if (cmd === 0xC0) {
               applyPreset(activeTrk, d1);
             }
           };
         }
         if (!ok) { pill.textContent = "USB READY"; pill.classList.remove("online"); }
+        else {
+          midiLabel = count === 1 ? firstName.toUpperCase().slice(0, 22) : `${count} MIDI IN`;
+          if (!learnMode) { pill.textContent = midiLabel; pill.classList.add("online"); }
+        }
+        midiInputCount = count; syncInputMode();
       };
       bind(); midi.onstatechange = bind;
-    } catch (e) { pill.textContent = "TOUCH MODE"; }
+    } catch (e) { pill.textContent = "TOUCH MODE"; syncInputMode(); }
   }
+
+  /* ===== Tastiera del computer: attiva su desktop quando non c'e' nessun controller MIDI =====
+     Piano (25 tasti, uno a uno): fila Z = C3..B3 con i neri su S D G H J, fila Q = C4..C5 con i neri sui numeri 2 3 5 6 7
+     Pad: 9 0 - = (fila alta) e O P [ ] (fila bassa)   |   Tracce: K L ; '
+     Space = play/stop, ` = overdub, Invio (tenuto) = sustain, , . = ottava -/+, / = pattern successivo
+     Frecce sinistra/destra = manopola, su/giu = valore (Shift = fine), Tab = pagina (Shift+Tab = indietro)
+     Si usa e.code, quindi vale per ogni layout. */
+  const KB_NOTES = {
+    KeyZ: [0, "Z"], KeyS: [1, "S"], KeyX: [2, "X"], KeyD: [3, "D"], KeyC: [4, "C"], KeyV: [5, "V"],
+    KeyG: [6, "G"], KeyB: [7, "B"], KeyH: [8, "H"], KeyN: [9, "N"], KeyJ: [10, "J"], KeyM: [11, "M"],
+    KeyQ: [12, "Q"], Digit2: [13, "2"], KeyW: [14, "W"], Digit3: [15, "3"], KeyE: [16, "E"], KeyR: [17, "R"],
+    Digit5: [18, "5"], KeyT: [19, "T"], Digit6: [20, "6"], KeyY: [21, "Y"], Digit7: [22, "7"], KeyU: [23, "U"], KeyI: [24, "I"]
+  };
+  const KB_PADS = {
+    Digit9: [0, "9"], Digit0: [1, "0"], Minus: [2, "-"], Equal: [3, "="],
+    KeyO: [4, "O"], KeyP: [5, "P"], BracketLeft: [6, "["], BracketRight: [7, "]"]
+  };
+  const KB_TRACKS = { KeyK: 0, KeyL: 1, Semicolon: 2, Quote: 3 };
+  const KB_ACTIONS = ["Space", "Backquote", "Enter", "Comma", "Period", "Slash", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
+
+  let kbMode = false, kbBase = 48, kbKnob = 0, kbSustain = false, kbToastTimer = null, midiInputCount = 0;
+  const kbDown = new Map();   // code -> { pad, note }, serve a rilasciare la nota giusta anche se cambia l'ottava
+
+  function kbToast(msg) {
+    if (learnMode) return;
+    const pill = document.getElementById("midiStatus");
+    pill.textContent = msg;
+    clearTimeout(kbToastTimer);
+    kbToastTimer = setTimeout(() => { if (kbMode && !learnMode) pill.textContent = "PC KEYBOARD"; }, 900);
+  }
+
+  function refreshKbHints() {
+    keyEls.forEach(el => delete el.dataset.kb);
+    padEls.forEach(el => delete el.dataset.kb);
+    knobsGrid.querySelectorAll(".knob-cell").forEach((c, i) => c.classList.toggle("kb-sel", kbMode && i === kbKnob));
+    if (!kbMode) return;
+    Object.values(KB_NOTES).forEach(([off, label]) => { const el = keyEls.get(kbBase + off - (viewBase - 48)); if (el) el.dataset.kb = label; });
+    Object.values(KB_PADS).forEach(([idx, label]) => { if (padEls[idx]) padEls[idx].dataset.kb = label; });
+  }
+
+  function releaseKbAll() {
+    kbDown.forEach(h => h.pad ? handleNoteOff(h.note, true, true) : handleNoteOff(h.note, false));
+    kbDown.clear();
+    if (kbSustain) { kbSustain = false; setSustain(false); }
+  }
+
+  function syncInputMode() {
+    const desktop = window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+    const next = desktop && midiInputCount === 0;
+    if (!next) releaseKbAll();
+    kbMode = next;
+    document.body.classList.toggle("kb-mode", kbMode);
+    if (kbMode && !learnMode) {
+      const pill = document.getElementById("midiStatus");
+      pill.textContent = "PC KEYBOARD"; pill.classList.add("online");
+    }
+    refreshKbHints();
+  }
+
+  function shiftOctave(d) {
+    const next = Math.max(24, Math.min(84, kbBase + d));
+    if (next === kbBase) return;
+    kbBase = next; setViewBase(kbBase); refreshKbHints();
+    kbToast(`OCT C${kbBase / 12 - 1}`);
+  }
+
+  function moveKbKnob(d) { kbKnob = (kbKnob + d + 8) % 8; refreshKbHints(); }
+
+  function nudgeKbKnob(dir, fine) {
+    const sp = specs()[kbKnob];
+    const step = Math.max(fine ? 0.01 : 0.05, sp.q ? sp.q / (sp.max - sp.min) : 0);
+    pickup[kbKnob] = false;
+    setKnobNormalized(kbKnob, Math.max(0, Math.min(1, currentNorm(kbKnob) + dir * step)));
+  }
+
+  const isTypingTarget = el => !!(el && el.matches && el.matches('input:not([type="range"]), textarea, select, [contenteditable]'));
+
+  window.addEventListener("keydown", (e) => {
+    if (!kbMode || e.ctrlKey || e.metaKey || e.altKey || isTypingTarget(e.target)) return;
+    const code = e.code, note = KB_NOTES[code], pad = KB_PADS[code], trk = KB_TRACKS[code];
+    if (!(note || pad || trk !== undefined || KB_ACTIONS.includes(code))) return;
+    e.preventDefault();
+    const focused = document.activeElement;   // evita che un pulsante col focus reagisca anche a Space/Invio
+    if (focused && focused !== document.body && focused.blur) focused.blur();
+    initAudio();
+
+    if (note || pad) {
+      if (e.repeat || kbDown.has(code)) return;
+      const n = note ? kbBase + note[0] : 36 + pad[0];
+      kbDown.set(code, { pad: !!pad, note: n });
+      handleNoteOn(n, pad ? 0.9 : 0.85, !!pad);
+      return;
+    }
+    if (code === "ArrowUp" || code === "ArrowDown") { nudgeKbKnob(code === "ArrowUp" ? 1 : -1, e.shiftKey); return; }
+    if (code === "ArrowLeft" || code === "ArrowRight") { moveKbKnob(code === "ArrowLeft" ? -1 : 1); return; }
+    if (e.repeat) return;
+    if (trk !== undefined) selectTrack(trk);
+    else if (code === "Space") document.getElementById("playBtn").click();
+    else if (code === "Backquote") document.getElementById("recBtn").click();
+    else if (code === "Comma") shiftOctave(-12);
+    else if (code === "Period") shiftOctave(12);
+    else if (code === "Enter") { kbSustain = true; setSustain(true); }
+    else if (code === "Slash") {
+      const b = document.querySelector(`.pat-btn[data-pat="${(activePat + 1) % 4}"]`);
+      if (b) b.click();
+    }
+  });
+
+  window.addEventListener("keyup", (e) => {
+    const h = kbDown.get(e.code);
+    if (h) {
+      kbDown.delete(e.code);
+      h.pad ? handleNoteOff(h.note, true, true) : handleNoteOff(h.note, false);
+    }
+    if (e.code === "Enter" && kbSustain) { kbSustain = false; setSustain(false); }
+    if (kbMode && e.code === "Space") e.preventDefault();
+  });
+  window.addEventListener("blur", releaseKbAll);
 
   /* Ripristino progetto salvato all'avvio */
   try {
@@ -1868,6 +2069,7 @@ input[type="range"]::-moz-range-thumb {
 
   window.addEventListener("visibilitychange", () => { if (document.hidden && saveDirty) saveProjectLocal(); });
   document.body.addEventListener("pointerdown", initAudio, { once: true });
+  syncInputMode();
   renderSteps(); updateKnobsUI(); applyTrackColor(0); renderBpm(); renderGroove(); renderPatternBtns();
 })();
 </script>
