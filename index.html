@@ -236,6 +236,8 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: 0 0 14px 4px var(--c-glow), inset 0 0 6px #fff;
 }
 
+.steps.focus { outline: 1px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+.step[data-r]::after { content: "\00d7" attr(data-r); position: absolute; top: 2px; right: 3px; font-size: 8px; font-weight: 800; color: inherit; }
 /* ===== Parametri: manopole con scala graduata + PITCH visualizer ===== */
 .pitch-viz {
   display: none; align-items: center; justify-content: space-between; gap: 8px;
@@ -746,6 +748,7 @@ input[type="range"]::-moz-range-thumb {
     { name: "DRUMS", pIdx: 0, muted: false, soloed: false, ratio: 1.0, mod: 180, att: 0.01, rel: 0.25, cut: 7500, res: 1.0, dly: 0.05, vol: 0.9, patterns: emptyPatterns() }
   ];
   tracks.forEach(t => Object.assign(t, WAVE_DEFAULTS, PITCH_DEFAULTS));
+  tracks.forEach(t => { t.rat = Array.from({ length: 4 }, () => Array.from({ length: 16 }, () => ({}))); });
 
   const currentSteps = (tIdx = activeTrk) => tracks[tIdx].patterns[activePat];
 
@@ -774,7 +777,7 @@ input[type="range"]::-moz-range-thumb {
         cw: t.cw, mw: t.mw, fold: t.fold, det: t.det,
         sub: t.sub, noi: t.noi, mdec: t.mdec, pe: t.pe,
         psteps: t.psteps, pscale: t.pscale, prate: t.prate, pglide: t.pglide, ploop: t.ploop, ptrans: t.ptrans, pfm: t.pfm,
-        patterns: t.patterns
+        patterns: t.patterns, rat: t.rat
       }))
     };
   }
@@ -804,6 +807,7 @@ input[type="range"]::-moz-range-thumb {
       } else if (Array.isArray(src.steps) && src.steps.length === 16) {
         dst.patterns[0] = src.steps.map(s => Array.isArray(s) ? [...s] : []);
       }
+      if (Array.isArray(src.rat) && src.rat.length === 4) dst.rat = src.rat.map((r, p) => Array.isArray(r) && r.length === 16 ? r.map((v, st) => { if (v && typeof v === "object") return { ...v }; const o = {}; if ((v | 0) > 1) (dst.patterns[p][st] || []).forEach(e => { o[e] = Math.min(4, v | 0); }); return o; }) : Array.from({ length: 16 }, () => ({})));
       if (i < 3) document.getElementById(`pName${i}`).textContent = PRESETS[dst.pIdx % PRESETS.length].name;
       const mb = document.querySelector(`.mute-btn[data-m="${i}"]`);
       mb.classList.toggle("muted", !!dst.muted);
@@ -1247,7 +1251,7 @@ input[type="range"]::-moz-range-thumb {
     if (isPad || activeTrk === 3) {
       const rawPad = (note >= 36 && note <= 43) ? (note - 36) : (note % 8);
       const pIdx = rawPad;
-      heldPads.add(pIdx);
+      heldPads.add(pIdx); renderSteps();
       tracks[3].last = pIdx;
       if (isEraseHeld && isPlaying) {
         didLiveErase = true;
@@ -1272,7 +1276,7 @@ input[type="range"]::-moz-range-thumb {
         return;
       }
       handleNoteOff(note, true);
-      tracks[activeTrk].last = n;
+      tracks[activeTrk].last = n; heldNotes.add(n); renderSteps();
       const v = startVoice(activeTrk, n, vel, null);
       if (v) activeVoices.set(note, v);
       requestAnimationFrame(() => flashKey(note, true));
@@ -1289,11 +1293,11 @@ input[type="range"]::-moz-range-thumb {
     if (isPad || activeTrk === 3) {
       const rawPad = (note >= 36 && note <= 43) ? (note - 36) : (note % 8);
       const pIdx = rawPad;
-      heldPads.delete(pIdx);
+      heldPads.delete(pIdx); renderSteps();
       return;
     }
     const n = activeTrk === 0 ? note - 12 : note;
-    heldNotes.delete(n);
+    heldNotes.delete(n); renderSteps();
     if (!force && sustainOn) {
       if (activeVoices.has(note)) sustainedNotes.add(note);
       flashKey(note, false);
@@ -1594,10 +1598,31 @@ input[type="range"]::-moz-range-thumb {
       const i = g * 4 + j;
       const s = document.createElement("div");
       s.className = "step"; s.textContent = i + 1;
+      let lpTimer = null, lpFired = false;
+      const cycleRatchet = () => {
+        const t = tracks[activeTrk], steps = currentSteps(activeTrk), r = t.rat[activePat][i], f = focusElem();
+        if (f !== null) { if (!steps[i].includes(f)) steps[i].push(f); r[f] = (r[f] || 1) % 4 + 1; }
+        else { if (!steps[i].length) steps[i] = [t.last !== undefined ? t.last : DEFAULT_NOTE[activeTrk]]; const nv = Math.max(...steps[i].map(e => r[e] || 1)) % 4 + 1; steps[i].forEach(e => { r[e] = nv; }); }
+                const n = f !== null ? f : steps[i][0];
+        if (activeTrk === 3) triggerDrum(n, 0.9); else startVoice(activeTrk, n, 0.8, 0.14);
+        renderSteps(); scheduleSave();
+      };
+      const cancelLp = () => clearTimeout(lpTimer);
+      s.onpointerdown = () => { lpFired = false; clearTimeout(lpTimer); lpTimer = setTimeout(() => { lpFired = true; cycleRatchet(); }, 300); };
+      s.onpointerup = cancelLp; s.onpointerleave = cancelLp; s.onpointercancel = cancelLp;
+      s.oncontextmenu = e => e.preventDefault();
       s.onclick = () => {
+        if (lpFired) { lpFired = false; return; }
+        const f = focusElem();
+        if (f !== null) {
+          const st = currentSteps(activeTrk), r = tracks[activeTrk].rat[activePat][i], k = st[i].indexOf(f);
+          if (k >= 0) { st[i].splice(k, 1); delete r[f]; }
+          else { st[i].push(f); if (activeTrk === 3) triggerDrum(f, 0.9); else startVoice(activeTrk, f, 0.8, 0.14); }
+          renderSteps(); scheduleSave(); return;
+        }
         const t = tracks[activeTrk];
         const steps = currentSteps(activeTrk);
-        if (steps[i].length) { steps[i] = []; }
+        if (steps[i].length) { steps[i] = []; tracks[activeTrk].rat[activePat][i] = {}; }
         else {
           const n = t.last !== undefined ? t.last : DEFAULT_NOTE[activeTrk];
           steps[i] = [n];
@@ -1611,9 +1636,22 @@ input[type="range"]::-moz-range-thumb {
     }
   }
 
+  /* Elemento "in primo piano": il pad (DRUMS) o la nota (altre tracce) tenuto premuto in questo momento */
+  function focusElem() {
+    const set = activeTrk === 3 ? heldPads : heldNotes;
+    return set.size ? [...set].pop() : null;
+  }
+
   function renderSteps() {
     const steps = currentSteps(activeTrk);
-    for (let i = 0; i < 16; i++) stepEls[i].classList.toggle("filled", steps[i].length > 0);
+    const f = focusElem(), rat = tracks[activeTrk].rat[activePat];
+    stepGrid.classList.toggle("focus", f !== null);
+    for (let i = 0; i < 16; i++) {
+      const el = steps[i], on = f !== null ? el.includes(f) : el.length > 0;
+      const r = on ? (f !== null ? (rat[i][f] || 1) : Math.max(...el.map(e => rat[i][e] || 1))) : 1;
+      stepEls[i].classList.toggle("filled", on);
+      if (r > 1) stepEls[i].dataset.r = r; else delete stepEls[i].dataset.r;
+    }
   }
 
   function renderPatternBtns() {
@@ -1641,6 +1679,7 @@ input[type="range"]::-moz-range-thumb {
     const nextPat = (activePat + 1) % 4;
     tracks.forEach(t => {
       t.patterns[nextPat] = t.patterns[activePat].map(s => [...s]);
+      t.rat[nextPat] = t.rat[activePat].map(o => ({ ...o }));
     });
     activePat = nextPat; queuedPat = null;
     renderPatternBtns(); renderSteps(); scheduleSave();
@@ -1741,11 +1780,11 @@ input[type="range"]::-moz-range-thumb {
         gateSec = Math.max(gateSec, pDur * pCnt * 0.95);
       }
       trk.patterns[activePat][sIdx].forEach(n => {
-        if (prob === 100 || Math.random() * 100 < prob) startVoice(t, n, 0.8, gateSec, when);
+        if (prob === 100 || Math.random() * 100 < prob) { const r = trk.rat[activePat][sIdx][n] || 1, sub = baseStepSec / r; for (let k = 0; k < r; k++) startVoice(t, n, 0.8 * (1 - 0.1 * k), r > 1 ? Math.min(gateSec, sub * 0.8) : gateSec, when + k * sub); }
       });
     }
     tracks[3].patterns[activePat][sIdx].forEach(p => {
-      if (prob === 100 || Math.random() * 100 < prob) triggerDrum(p, 0.9, when);
+      if (prob === 100 || Math.random() * 100 < prob) { const r = tracks[3].rat[activePat][sIdx][p] || 1, sub = baseStepSec / r; for (let k = 0; k < r; k++) triggerDrum(p, 0.9 * (1 - 0.1 * k), when + k * sub); }
     });
 
     const uiDelayMs = Math.max(0, (when - ctx.currentTime) * 1000);
@@ -1815,6 +1854,7 @@ input[type="range"]::-moz-range-thumb {
     clearBtn.classList.remove("erasing");
     if (shouldClearAll) {
       tracks[activeTrk].patterns[activePat] = emptySteps();
+      tracks[activeTrk].rat[activePat] = Array.from({ length: 16 }, () => ({}));
       renderSteps(); scheduleSave();
     }
   };
