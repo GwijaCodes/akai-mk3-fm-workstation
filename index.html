@@ -746,7 +746,7 @@ input[type="range"]::-moz-range-thumb {
     { name: "BASS", pIdx: 0, muted: false, soloed: false, ratio: 1, mod: 140, att: 0.01, rel: 0.28, cut: 1100, res: 2.5, dly: 0.0, vol: 0.85, patterns: emptyPatterns() },
     { name: "CHORD", pIdx: 2, muted: false, soloed: false, ratio: 3.5, mod: 115, att: 0.02, rel: 0.75, cut: 3400, res: 1.2, dly: 0.3, vol: 0.65, patterns: emptyPatterns() },
     { name: "LEAD", pIdx: 4, muted: false, soloed: false, ratio: 1, mod: 260, att: 0.07, rel: 0.45, cut: 3800, res: 3.0, dly: 0.28, vol: 0.72, patterns: emptyPatterns() },
-    { name: "DRUMS", pIdx: 0, muted: false, soloed: false, ratio: 1.0, mod: 180, att: 0.01, rel: 0.25, cut: 7500, res: 1.0, dly: 0.05, vol: 0.9, patterns: emptyPatterns() }
+    { name: "DRUMS", pIdx: 0, muted: false, soloed: false, ratio: 1.0, mod: 180, att: 0.01, rel: 0.25, cut: 7500, res: 1.0, dly: 0.0, vol: 0.9, patterns: emptyPatterns() }
   ];
   tracks.forEach(t => Object.assign(t, WAVE_DEFAULTS, PITCH_DEFAULTS));
   tracks.forEach(t => { t.rat = Array.from({ length: 4 }, () => Array.from({ length: 16 }, () => ({}))); });
