@@ -1405,7 +1405,7 @@ input[type="range"]::-moz-range-thumb {
     /* Akai MPK Mini: la fila bassa dei pad (note 36-39) corrisponde alla fila bassa della griglia, quindi ^ 4 */
     for (let ch = 1; ch < 16; ch++) for (let n = 36; n <= 43; n++) p.pads[`n${ch}:${n}`] = (n - 36) ^ 4;
     for (let n = 36; n <= 51; n++) p.pads[`n9:${n}`] = (n <= 43 ? n - 36 : n % 8) ^ 4;
-    for (let k = 0; k < 8; k++) { p.knobs[70 + k] = k; if (k >= 4) p.knobs[1 + k] = k; }
+    for (let k = 0; k < 8; k++) { p.knobs[70 + k] = k; p.knobs[1 + k] = k; }
     [9, 10, 11, 12].forEach(cc => { p.knobs[cc] = cc - 5; });
     p.knobs[14] = 6; p.knobs[15] = 7;
     for (let cc = 24; cc <= 27; cc++) p.knobs[cc] = cc - 20;
@@ -1424,6 +1424,14 @@ input[type="range"]::-moz-range-thumb {
     if (/akai|mpk/i.test(name) && !profiles[name].joyFix) {   // profili salvati prima del fix: libera CC1-4
       [1, 2, 3, 4].forEach(cc => { delete profiles[name].knobs[cc]; });
       profiles[name].joyFix = 1; saveProfiles();
+    }
+    if (/akai|mpk/i.test(name) && profiles[name].knobMapVersion !== 4) {
+      for (let k = 0; k < 8; k++) { profiles[name].knobs[70 + k] = k; profiles[name].knobs[1 + k] = k; }
+      [9, 10, 11, 12].forEach(cc => { profiles[name].knobs[cc] = cc - 5; });
+      profiles[name].knobs[14] = 6; profiles[name].knobs[15] = 7;
+      for (let cc = 24; cc <= 27; cc++) profiles[name].knobs[cc] = cc - 20;
+      profiles[name].knobMapVersion = 4;
+      saveProfiles();
     }
     return profiles[name];
   }
@@ -1981,7 +1989,7 @@ input[type="range"]::-moz-range-thumb {
 
   async function initMIDI() {
     const pill = document.getElementById("midiStatus");
-    if (!navigator.requestMIDIAccess) { pill.textContent = "TOUCH MODE"; syncInputMode(); return; }
+    if (!navigator.requestMIDIAccess) { midiReady = true; pill.textContent = "TOUCH MODE"; syncInputMode(); return; }
     try {
       const midi = await navigator.requestMIDIAccess();
       const bind = () => {
@@ -2033,10 +2041,10 @@ input[type="range"]::-moz-range-thumb {
           midiLabel = count === 1 ? firstName.toUpperCase().slice(0, 22) : `${count} MIDI IN`;
           if (!learnMode) { pill.textContent = midiLabel; pill.classList.add("online"); }
         }
-        midiInputCount = count; syncInputMode();
+        midiInputCount = count; midiReady = true; syncInputMode();
       };
       bind(); midi.onstatechange = bind;
-    } catch (e) { pill.textContent = "TOUCH MODE"; syncInputMode(); }
+    } catch (e) { midiReady = true; pill.textContent = "TOUCH MODE"; syncInputMode(); }
   }
 
   /* ===== Tastiera del computer: attiva su desktop quando non c'e' nessun controller MIDI =====
@@ -2058,7 +2066,7 @@ input[type="range"]::-moz-range-thumb {
   const KB_TRACKS = { KeyK: 0, KeyL: 1, Semicolon: 2, Quote: 3 };
   const KB_ACTIONS = ["Space", "Backquote", "Enter", "Comma", "Period", "Slash", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
 
-  let kbMode = false, kbBase = 48, kbKnob = 0, kbSustain = false, kbToastTimer = null, midiInputCount = 0;
+  let kbMode = false, kbBase = 48, kbKnob = 0, kbSustain = false, kbToastTimer = null, midiInputCount = 0, midiReady = false;
   const kbDown = new Map();   // code -> { pad, note }, serve a rilasciare la nota giusta anche se cambia l'ottava
 
   function kbToast(msg) {
@@ -2086,7 +2094,7 @@ input[type="range"]::-moz-range-thumb {
 
   function syncInputMode() {
     const desktop = window.matchMedia("(hover: hover) and (pointer: fine)").matches;
-    const next = desktop && midiInputCount === 0;
+    const next = desktop && midiReady && midiInputCount === 0;
     if (!next) releaseKbAll();
     kbMode = next;
     document.body.classList.toggle("kb-mode", kbMode);
