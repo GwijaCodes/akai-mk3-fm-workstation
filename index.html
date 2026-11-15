@@ -307,6 +307,7 @@ input[type="range"]::-moz-range-thumb {
   -webkit-mask: radial-gradient(circle, transparent 0 21px, #000 22px);
   mask: radial-gradient(circle, transparent 0 21px, #000 22px);
 }
+.joy-ring { touch-action: none; cursor: grab; }
 .joy-stick {
   position: absolute; width: 22px; height: 22px; border: 1px solid #000; border-radius: 50%;
   background: radial-gradient(circle at 35% 30%, #9a9fad, #23262e 65%, #0d0e12);
@@ -583,7 +584,7 @@ input[type="range"]::-moz-range-thumb {
 <script>
 (() => {
   const STORAGE_KEY = "akai_mpk_mk3_fm4_project_v1";
-  let ctx = null, masterGain = null, delayNode = null, delayFb = null, destStream = null, recorder = null, chunks = [];
+  let ctx = null, masterGain = null, perfHP = null, perfLP = null, delayNode = null, delayFb = null, destStream = null, recorder = null, chunks = [];
   let trkFilters = [], trkDlySends = [];
   let isPlaying = false, isOverdub = false, isRecWav = false;
   let bpm = 115, swing = 0, prob = 100;
@@ -835,7 +836,7 @@ input[type="range"]::-moz-range-thumb {
   function syncTrackChannel(i) {
     if (!ctx || !trkFilters[i]) return;
     const t = tracks[i], now = ctx.currentTime;
-    const cutAmt = Math.max(120, Math.min(12000, t.cut + joyY * 4500));
+    const cutAmt = Math.max(120, Math.min(12000, t.cut));
     trkFilters[i].frequency.setTargetAtTime(cutAmt, now, 0.008);
     trkFilters[i].Q.setTargetAtTime(t.res, now, 0.008);
     trkDlySends[i].gain.setTargetAtTime(t.dly, now, 0.008);
@@ -887,7 +888,10 @@ input[type="range"]::-moz-range-thumb {
     silentGain.connect(ctx.destination);
     keepAlive.start();
 
-    masterGain.connect(limiter); delayNode.connect(limiter); limiter.connect(ctx.destination);
+    perfHP = ctx.createBiquadFilter(); perfHP.type = "highpass"; perfHP.frequency.value = 20; perfHP.Q.value = 1;
+    perfLP = ctx.createBiquadFilter(); perfLP.type = "lowpass"; perfLP.frequency.value = 20000; perfLP.Q.value = 1;
+    masterGain.connect(perfHP); delayNode.connect(perfHP); perfHP.connect(perfLP); perfLP.connect(limiter);
+    limiter.connect(ctx.destination);
     if (ctx.createMediaStreamDestination) {
       destStream = ctx.createMediaStreamDestination();
       limiter.connect(destStream);
@@ -899,6 +903,33 @@ input[type="range"]::-moz-range-thumb {
     const dot = document.getElementById("joyDot");
     dot.style.transform = `translate(${joyX * 18}px, ${-joyY * 18}px)`;
   }
+
+  /* Filtro DJ sul master (drum e delay inclusi): leva su = passa alto, leva giu = passa basso */
+  function applyPerfFilter() {
+    if (!ctx || !perfHP) return;
+    const now = ctx.currentTime;
+    perfHP.frequency.setTargetAtTime(joyY > 0 ? 20 * Math.pow(250, joyY) : 20, now, 0.02);
+    perfLP.frequency.setTargetAtTime(joyY < 0 ? 20000 * Math.pow(0.01, -joyY) : 20000, now, 0.02);
+  }
+
+  /* Pitch bend: aggiorna in tempo reale le note tenute */
+  function bendLive() { activeVoices.forEach(v => v.bend && v.bend()); }
+
+  /* Leva a schermo: asse orizzontale = pitch bend (+/-2 semitoni), ritorna al centro al rilascio */
+  const joyRing = document.querySelector(".joy-ring");
+  function setJoy(x, y) {
+    joyX = Math.abs(x) < 0.05 ? 0 : Math.max(-1, Math.min(1, x));
+    joyY = Math.abs(y) < 0.05 ? 0 : Math.max(-1, Math.min(1, y));
+    pitchBend = joyX * 2;
+    updateJoystickVisual(); bendLive(); applyPerfFilter();
+  }
+  const joyDrag = (e) => {
+    const r = joyRing.getBoundingClientRect();
+    setJoy((e.clientX - (r.left + r.width / 2)) / 18, -(e.clientY - (r.top + r.height / 2)) / 18);
+  };
+  joyRing.onpointerdown = (e) => { e.preventDefault(); initAudio(); joyRing.setPointerCapture(e.pointerId); joyDrag(e); };
+  joyRing.onpointermove = (e) => { if (joyRing.hasPointerCapture(e.pointerId)) joyDrag(e); };
+  joyRing.onpointerup = joyRing.onpointercancel = () => setJoy(0, 0);
 
   function flashKey(note, on) {
     const k = on ? keyEls.get(note - (viewBase - 48)) : (litKeys.get(note) || keyEls.get(note - (viewBase - 48)));
@@ -943,7 +974,7 @@ input[type="range"]::-moz-range-thumb {
     const t = tracks[tIdx];
     if (!isAudible(tIdx)) return null;
     const now = when !== null ? Math.max(ctx.currentTime, when) : ctx.currentTime;
-    const freq = 440 * Math.pow(2, (note + pitchBend - 69) / 12);
+    let freq = 440 * Math.pow(2, (note + pitchBend - 69) / 12);
     const cwI = Math.round(t.cw), pe = Math.pow(2, (t.pe || 0) / 12);
     const trkOut = trkFilters[tIdx];
 
@@ -984,7 +1015,7 @@ input[type="range"]::-moz-range-thumb {
     registerPitchOsc(car, 1);
     registerPitchOsc(mod, t.ratio);
 
-    const getModAmt = () => Math.max(1, (t.mod + Math.max(0, joyY) * 350) * vel);
+    const getModAmt = () => Math.max(1, t.mod * vel);
     let modAmt = getModAmt();
     const modDec = (t.att + t.rel) * (t.mdec || 1);
     modGain.gain.setValueAtTime(modAmt, now);
@@ -1157,8 +1188,16 @@ input[type="range"]::-moz-range-thumb {
       }
     };
 
+    const bend = () => {
+      if (released || !ctx) return;
+      freq = 440 * Math.pow(2, (note + pitchBend - 69) / 12);
+      const tNow = ctx.currentTime, cyc = getCycleInfo().cycle;
+      const cr = Math.pow(2, (cyc[(stepCounter - 1) % cyc.length] || 0) / 12);
+      pitchTargets.forEach(({ o, mult }) => o.frequency.setTargetAtTime(freq * mult * cr, tNow, 0.01));
+    };
+
     if (autoGateSec !== null) release(now + autoGateSec);
-    return { release, syncLive, note, tIdx };
+    return { release, syncLive, bend, note, tIdx };
   }
 
   /* ===== Drum Kit modulato da K1-K8 ===== */
@@ -1366,7 +1405,7 @@ input[type="range"]::-moz-range-thumb {
     /* Akai MPK Mini: la fila bassa dei pad (note 36-39) corrisponde alla fila bassa della griglia, quindi ^ 4 */
     for (let ch = 1; ch < 16; ch++) for (let n = 36; n <= 43; n++) p.pads[`n${ch}:${n}`] = (n - 36) ^ 4;
     for (let n = 36; n <= 51; n++) p.pads[`n9:${n}`] = (n <= 43 ? n - 36 : n % 8) ^ 4;
-    for (let k = 0; k < 8; k++) { p.knobs[70 + k] = k; p.knobs[1 + k] = k; }
+    for (let k = 0; k < 8; k++) { p.knobs[70 + k] = k; if (k >= 4) p.knobs[1 + k] = k; }
     [9, 10, 11, 12].forEach(cc => { p.knobs[cc] = cc - 5; });
     p.knobs[14] = 6; p.knobs[15] = 7;
     for (let cc = 24; cc <= 27; cc++) p.knobs[cc] = cc - 20;
@@ -1382,7 +1421,19 @@ input[type="range"]::-moz-range-thumb {
 
   function getProfile(name) {
     if (!profiles[name]) { profiles[name] = defaultProfile(name); saveProfiles(); }
+    if (/akai|mpk/i.test(name) && !profiles[name].joyFix) {   // profili salvati prima del fix: libera CC1-4
+      [1, 2, 3, 4].forEach(cc => { delete profiles[name].knobs[cc]; });
+      profiles[name].joyFix = 1; saveProfiles();
+    }
     return profiles[name];
+  }
+
+  /* Leva fisica via CC: profile.joy = { "<cc>": 0 su | 1 giu | 2 sinistra | 3 destra }, assegnata con LEARN toccando la leva a schermo */
+  const JOY_NAMES = ["JOY SU", "JOY GIU", "JOY SX", "JOY DX"], joyCCv = [0, 0, 0, 0];
+  function joyCC(dir, v) {
+    joyCCv[dir] = v;
+    if (dir < 2) setJoy(joyX, joyCCv[0] - joyCCv[1]);
+    else setJoy(joyCCv[3] - joyCCv[2], joyY);
   }
 
   const pageBar = document.getElementById("pageBar");
@@ -1419,14 +1470,14 @@ input[type="range"]::-moz-range-thumb {
   };
   pageBar.appendChild(resetBtn);
 
-  const learnEl = t => t.type === "pad" ? padEls[t.idx]
+  const learnEl = t => t.type === "joy" ? joyRing : t.type === "pad" ? padEls[t.idx]
     : t.type === "knob" ? knobsGrid.querySelectorAll(".knob-cell")[t.idx]
     : pageBar.querySelectorAll(".page-btn")[t.idx];
 
   function refreshLearnPill() {
     if (!learnMode) return;
     const t = learnTarget;
-    const what = !t ? "SCEGLI" : t.type === "pad" ? `PAD ${t.idx + 1}` : t.type === "knob" ? `K${t.idx + 1}` : PAGES[t.idx].name;
+    const what = !t ? "SCEGLI" : t.type === "pad" ? `PAD ${t.idx + 1}` : t.type === "knob" ? `K${t.idx + 1}` : t.type === "joy" ? JOY_NAMES[t.idx] : PAGES[t.idx].name;
     document.getElementById("midiStatus").textContent = `LEARN · ${what}`;
   }
 
@@ -1452,11 +1503,12 @@ input[type="range"]::-moz-range-thumb {
   /* In learn mode i tocchi su pad, manopole e pagine scelgono il bersaglio invece di suonare */
   document.addEventListener("pointerdown", (e) => {
     if (!learnMode) return;
-    const el = e.target.closest(".pad, .knob-cell, .page-btn");
+    const el = e.target.closest(".pad, .knob-cell, .page-btn, .joy-ring");
     if (!el) return;
     e.preventDefault(); e.stopPropagation();
     const idx = list => Array.prototype.indexOf.call(list, el);
-    if (el.classList.contains("pad")) setLearnTarget({ type: "pad", idx: Number(el.dataset.p) });
+    if (el.classList.contains("joy-ring")) setLearnTarget({ type: "joy", idx: 0 });
+    else if (el.classList.contains("pad")) setLearnTarget({ type: "pad", idx: Number(el.dataset.p) });
     else if (el.classList.contains("knob-cell")) setLearnTarget({ type: "knob", idx: idx(knobsGrid.querySelectorAll(".knob-cell")) });
     else setLearnTarget({ type: "tab", idx: idx(pageBar.querySelectorAll(".page-btn")) });
   }, true);
@@ -1470,10 +1522,11 @@ input[type="range"]::-moz-range-thumb {
     if (t.type === "pad" && (isNote || isCc)) { map = profile.pads; key = `${isNote ? "n" : "c"}${ch}:${d1}`; }
     else if (t.type === "knob" && isCc) { map = profile.knobs; key = String(d1); }
     else if (t.type === "tab" && isCc) { map = profile.tabs; key = String(d1); }
+    else if (t.type === "joy" && isCc) { map = profile.joy = profile.joy || {}; key = String(d1); delete profile.knobs[d1]; delete profile.tabs[d1]; }
     if (!map) return;
     map[key] = t.idx;
     saveProfiles();
-    const total = t.type === "tab" ? PAGES.length : 8;
+    const total = t.type === "tab" ? PAGES.length : t.type === "joy" ? 4 : 8;
     setLearnTarget(t.idx + 1 < total ? { type: t.type, idx: t.idx + 1 } : null);
   }
 
@@ -1952,10 +2005,12 @@ input[type="range"]::-moz-range-thumb {
             } else if (cmd === 0xE0) {
               const raw = ((d2 << 7) | d1) - 8192;
               joyX = raw / 8192;
-              pitchBend = joyX * 2;
+              pitchBend = joyX * 2; bendLive();
               updateJoystickVisual();
             } else if (cmd === 0xB0) {
               if (d1 === 64) { setSustain(d2 >= 64); return; }
+              const jd = profile.joy && profile.joy[d1];
+              if (jd !== undefined) { joyCC(jd, d2 / 127); return; }
               const pad = profile.pads[`c${ch}:${d1}`];
               if (pad !== undefined) {
                 if (d2 > 0) handleNoteOn(36 + pad, d2 / 127, true); else handleNoteOff(36 + pad, false, true);
