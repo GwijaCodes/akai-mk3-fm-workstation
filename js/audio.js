@@ -1,15 +1,19 @@
 import { OSC_TYPES, PITCH_PATTERNS, PITCH_RATES } from "./state.js";
 
 export const DRUM_SAMPLE_FILES = [
-  "./samples/01_kick.wav",
-  "./samples/02_snare.wav",
-  "./samples/03_closed_hat.wav",
-  "./samples/04_open_hat.wav",
-  "./samples/05_clap.wav",
-  "./samples/06_low_tom.wav",
-  "./samples/07_high_tom.wav",
-  "./samples/08_rim.wav"
+  "./drums/01_kick.wav",
+  "./drums/02_snare_soft.wav",
+  "./drums/02_snare_hard.wav",
+  "./drums/03_closed_hat.wav",
+  "./drums/04_open_hat.wav",
+  "./drums/05_crash.wav",
+  "./drums/06_ride.wav",
+  "./drums/07_high_tom.wav",
+  "./drums/08_rim.wav"
 ];
+
+const DRUM_SAMPLE_INDEX_BY_INSTRUMENT = [0, 1, 3, 4, 5, 6, 7, 8];
+const HARD_SNARE_VELOCITY = 0.6;
 
 export class WavDrumEngine {
   constructor(sampleFiles = DRUM_SAMPLE_FILES) {
@@ -90,8 +94,11 @@ export class WavDrumEngine {
     instrument, velocity, when = this.context?.currentTime,
     trackVolume = 1, trackCutoff = Infinity, trackResonance = 0.707
   ) {
-    if (!this.ready || !this.context || !this.output || !this.buffers.has(instrument)) return false;
-    const buffer = this.buffers.get(instrument);
+    const sampleIndex = instrument === 1 && velocity >= HARD_SNARE_VELOCITY
+      ? 2
+      : DRUM_SAMPLE_INDEX_BY_INSTRUMENT[instrument];
+    if (!this.ready || !this.context || !this.output || !this.buffers.has(sampleIndex)) return false;
+    const buffer = this.buffers.get(sampleIndex);
     const startAt = Math.max(this.context.currentTime, when);
 
     if (instrument === 2) this.chokeOpenHats(startAt);

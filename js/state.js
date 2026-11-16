@@ -3,7 +3,7 @@ export const STORAGE_KEY = "akai_mpk_mk3_fm4_project_v1";
 
   export const PADS_INFO = [
     { name: "KICK" }, { name: "SNARE" }, { name: "C-HAT" }, { name: "O-HAT" },
-    { name: "CLAP" }, { name: "LO-TOM" }, { name: "HI-TOM" }, { name: "RIM" }
+    { name: "CRASH" }, { name: "RIDE" }, { name: "HI-TOM" }, { name: "RIM" }
   ];
 
   export const KNOB_SPECS = [
