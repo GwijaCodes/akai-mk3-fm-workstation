@@ -93,7 +93,7 @@ export const STORAGE_KEY = "akai_mpk_mk3_fm4_project_v1";
     return Array.from({ length: 16 }, () => []);
   }
   export function emptyPatterns() {
-    return Array.from({ length: 4 }, () => emptySteps());
+    return Array.from({ length: 4 }, () => []);
   }
   export const tracks = [
     { name: "BASS", pIdx: 0, muted: false, soloed: false, ratio: 1, mod: 140, att: 0.01, rel: 0.28, cut: 1100, res: 2.5, dly: 0.0, vol: 0.85, patterns: emptyPatterns() },
@@ -102,12 +102,15 @@ export const STORAGE_KEY = "akai_mpk_mk3_fm4_project_v1";
     { name: "DRUMS", pIdx: 0, muted: false, soloed: false, ratio: 1.0, mod: 180, att: 0.01, rel: 0.25, cut: 7500, res: 1.0, dly: 0.0, vol: 0.9, patterns: emptyPatterns() }
   ];
   tracks.forEach(t => Object.assign(t, WAVE_DEFAULTS, PITCH_DEFAULTS));
-  tracks.forEach(t => { t.rat = Array.from({ length: 4 }, () => Array.from({ length: 16 }, () => ({}))); });
 
-export function serializeProject({ bpm, swing, prob, activePat, tracks }) {
+export function serializeProject({
+  bpm, swing, prob, activePat, chainEnabled, scaleMode, page, tracks
+}) {
   return {
-    version: 1,
-    bpm, swing, prob, activePat,
+    version: 2,
+    ppqn: 96,
+    ticksPerBar: 384,
+    bpm, swing, prob, activePat, chainEnabled, scaleMode, page,
     tracks: tracks.map(t => ({
       pIdx: t.pIdx, muted: t.muted, soloed: t.soloed,
       ratio: t.ratio, mod: t.mod, att: t.att, rel: t.rel,
@@ -115,7 +118,7 @@ export function serializeProject({ bpm, swing, prob, activePat, tracks }) {
       cw: t.cw, mw: t.mw, fold: t.fold, det: t.det,
       sub: t.sub, noi: t.noi, mdec: t.mdec, pe: t.pe,
       psteps: t.psteps, pscale: t.pscale, prate: t.prate, pglide: t.pglide, ploop: t.ploop, ptrans: t.ptrans, pfm: t.pfm,
-      patterns: t.patterns, rat: t.rat
+      patterns: t.patterns.map(events => events.map(event => ({ ...event })))
     }))
   };
 }
@@ -128,6 +131,9 @@ export function hydrateProjectState(data, transport, targetTracks) {
   if (typeof data.swing === "number") nextTransport.swing = Math.max(0, Math.min(75, data.swing));
   if (typeof data.prob === "number") nextTransport.prob = Math.max(10, Math.min(100, data.prob));
   if (typeof data.activePat === "number") nextTransport.activePat = Math.max(0, Math.min(3, data.activePat));
+  if (typeof data.chainEnabled === "boolean") nextTransport.chainEnabled = data.chainEnabled;
+  if (["1/16", "1/32", "1/16T"].includes(data.scaleMode)) nextTransport.scaleMode = data.scaleMode;
+  if (data.page === 0 || data.page === 1) nextTransport.page = data.page;
 
   data.tracks.forEach((src, i) => {
     const dst = targetTracks[i];
@@ -137,14 +143,60 @@ export function hydrateProjectState(data, transport, targetTracks) {
       if (src[k] !== undefined) dst[k] = src[k];
     });
     if (Array.isArray(src.patterns) && src.patterns.length === 4) {
-      dst.patterns = src.patterns.map(pat =>
-        Array.isArray(pat) && pat.length === 16 ? pat.map(s => Array.isArray(s) ? [...s] : []) : emptySteps()
-      );
+      if (data.version >= 2 || data.ppqn === 96) {
+        dst.patterns = src.patterns.map(pattern => {
+          if (!Array.isArray(pattern)) return [];
+          return pattern.map(copyPatternEvent).filter(event =>
+            event && (i === 3
+              ? Number.isInteger(event.instrument) && event.instrument >= 0 && event.instrument < 8
+              : typeof event.instrument === "string" && Number.isInteger(event.note))
+          ).sort((a, b) => a.tick - b.tick);
+        });
+      } else {
+        dst.patterns = src.patterns.map((pattern, patternIndex) =>
+          migrateLegacyPattern(pattern, src.rat?.[patternIndex], i)
+        );
+      }
     } else if (Array.isArray(src.steps) && src.steps.length === 16) {
-      dst.patterns[0] = src.steps.map(s => Array.isArray(s) ? [...s] : []);
+      dst.patterns[0] = migrateLegacyPattern(src.steps, src.rat?.[0], i);
+    } else {
+      dst.patterns = emptyPatterns();
     }
-    if (Array.isArray(src.rat) && src.rat.length === 4) dst.rat = src.rat.map((r, p) => Array.isArray(r) && r.length === 16 ? r.map((v, st) => { if (v && typeof v === "object") return { ...v }; const o = {}; if ((v | 0) > 1) (dst.patterns[p][st] || []).forEach(e => { o[e] = Math.min(4, v | 0); }); return o; }) : Array.from({ length: 16 }, () => ({})));
   });
 
   return nextTransport;
+}
+
+function copyPatternEvent(event) {
+  if (!event || !Number.isInteger(event.tick) || event.tick < 0 || event.tick >= 384) return null;
+  if (!Number.isFinite(event.velocity) || event.velocity < 0 || event.velocity > 1) return null;
+  if (!(typeof event.instrument === "string" || Number.isInteger(event.instrument))) return null;
+  return { ...event };
+}
+
+function migrateLegacyPattern(steps, ratchets, trackIndex) {
+  if (!Array.isArray(steps) || steps.length !== 16) return [];
+  const events = [];
+  steps.forEach((step, stepIndex) => {
+    if (!Array.isArray(step)) return;
+    step.forEach(instrumentValue => {
+      if (!Number.isFinite(instrumentValue)) return;
+      const count = Math.max(1, Math.min(4, Number(ratchets?.[stepIndex]?.[instrumentValue]) | 0));
+      const safeCount = Number(ratchets?.[stepIndex]?.[instrumentValue]) > 1 ? count : 1;
+      for (let hit = 0; hit < safeCount; hit++) {
+        const event = {
+          tick: stepIndex * 24 + hit * (24 / safeCount),
+          instrument: trackIndex === 3 ? instrumentValue : "fm",
+          velocity: (trackIndex === 3 ? 0.9 : 0.8) * (1 - 0.1 * hit)
+        };
+        if (trackIndex !== 3) event.note = instrumentValue;
+        if (safeCount > 1) {
+          event.ratchetGroup = `${stepIndex * 24}:${instrumentValue}`;
+          if (trackIndex !== 3) event.gateTicks = (24 / safeCount) * 0.8;
+        }
+        events.push(event);
+      }
+    });
+  });
+  return events;
 }

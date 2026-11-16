@@ -64,13 +64,34 @@
 
   <div class="seq-shell">
     <div class="pat-bar" id="patBar">
-      <button class="pat-btn on" data-pat="0">A</button>
-      <button class="pat-btn" data-pat="1">B</button>
-      <button class="pat-btn" data-pat="2">C</button>
-      <button class="pat-btn" data-pat="3">D</button>
+      <div class="pat-select">
+        <button class="pat-btn on" data-pat="0">A</button>
+        <button class="pat-btn" data-pat="1">B</button>
+        <button class="pat-btn" data-pat="2">C</button>
+        <button class="pat-btn" data-pat="3">D</button>
+      </div>
       <button class="pat-copy" id="copyPatBtn" title="Clone Pattern" aria-label="Clone Pattern">
         <svg class="ic-sm" viewBox="0 0 16 16"><path d="M5 2h8v9h-2V4H5V2zm-2 3h7v9H3V5z"/></svg>
       </button>
+      <div class="pat-hardware">
+        <button class="pat-hw-btn" id="chainBtn" aria-pressed="false" title="Chain populated patterns">
+          <i class="led"></i><span>CHAIN</span>
+        </button>
+        <div class="scale-control">
+          <button class="pat-hw-btn" id="scaleBtn" title="Change sequencer scale">SCALE</button>
+          <div class="scale-leds" aria-label="Scale">
+            <span data-scale-led="1/16"><i></i><small>1/16</small></span>
+            <span data-scale-led="1/32"><i></i><small>1/32</small></span>
+            <span data-scale-led="1/16T"><i></i><small>1/16T</small></span>
+          </div>
+        </div>
+        <button class="pat-hw-btn page-btn active" id="pageFirstBtn" aria-pressed="true" title="Steps 1-16">
+          <span>1-16</span><i class="led"></i>
+        </button>
+        <button class="pat-hw-btn page-btn" id="pageSecondBtn" aria-pressed="false" title="Steps 17-32">
+          <span>17-32</span><i class="led"></i>
+        </button>
+      </div>
     </div>
     <div class="steps" id="stepGrid"></div>
   </div>

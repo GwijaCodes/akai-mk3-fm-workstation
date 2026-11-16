@@ -1,5 +1,148 @@
 import { OSC_TYPES, PITCH_PATTERNS, PITCH_RATES } from "./state.js";
 
+export const DRUM_SAMPLE_FILES = [
+  "./samples/01_kick.wav",
+  "./samples/02_snare.wav",
+  "./samples/03_closed_hat.wav",
+  "./samples/04_open_hat.wav",
+  "./samples/05_clap.wav",
+  "./samples/06_low_tom.wav",
+  "./samples/07_high_tom.wav",
+  "./samples/08_rim.wav"
+];
+
+export class WavDrumEngine {
+  constructor(sampleFiles = DRUM_SAMPLE_FILES) {
+    this.sampleFiles = sampleFiles;
+    this.fileData = new Map();
+    this.buffers = new Map();
+    this.openHatVoices = new Set();
+    this.context = null;
+    this.output = null;
+    this.delaySend = null;
+    this.ready = false;
+    this.unavailableFiles = [];
+    this.preloadPromise = this.preload();
+  }
+
+  async preload() {
+    const results = await Promise.all(this.sampleFiles.map(async (file, instrument) => {
+      try {
+        const response = await fetch(file);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return { file, instrument, data: await response.arrayBuffer() };
+      } catch (error) {
+        return { file, instrument, error };
+      }
+    }));
+
+    this.unavailableFiles = results.filter(result => result.error).map(result => result.file);
+    if (this.unavailableFiles.length) {
+      console.error(
+        "[WavDrumEngine] Campioni mancanti o non caricabili; uso FM Kit:",
+        this.unavailableFiles
+      );
+      return false;
+    }
+
+    results.forEach(({ instrument, data }) => this.fileData.set(instrument, data));
+    return true;
+  }
+
+  async attach(context, output, delaySend) {
+    this.context = context;
+    this.output = output;
+    this.delaySend = delaySend;
+    if (!await this.preloadPromise) return false;
+    return this.decodeSamples();
+  }
+
+  async decodeSamples() {
+    const decoded = await Promise.all(this.sampleFiles.map(async (file, instrument) => {
+      try {
+        const source = this.fileData.get(instrument);
+        if (!source) throw new Error("Sample data is unavailable");
+        const buffer = await this.context.decodeAudioData(source.slice(0));
+        return { instrument, buffer };
+      } catch (error) {
+        return { file, instrument, error };
+      }
+    }));
+
+    this.unavailableFiles = decoded.filter(result => result.error).map(result => result.file);
+    this.fileData.clear();
+    if (this.unavailableFiles.length) {
+      this.buffers.clear();
+      this.ready = false;
+      console.error(
+        "[WavDrumEngine] Campioni mancanti o non decodificabili; uso FM Kit:",
+        this.unavailableFiles
+      );
+      return false;
+    }
+
+    decoded.forEach(({ instrument, buffer }) => this.buffers.set(instrument, buffer));
+    this.ready = true;
+    return true;
+  }
+
+  play(
+    instrument, velocity, when = this.context?.currentTime,
+    trackVolume = 1, trackCutoff = Infinity, trackResonance = 0.707
+  ) {
+    if (!this.ready || !this.context || !this.output || !this.buffers.has(instrument)) return false;
+    const buffer = this.buffers.get(instrument);
+    const startAt = Math.max(this.context.currentTime, when);
+
+    if (instrument === 2) this.chokeOpenHats(startAt);
+
+    const source = this.context.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.setValueAtTime(0.99 + Math.random() * 0.02, startAt);
+
+    const filter = this.context.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.setValueAtTime(
+      Math.min(this.context.sampleRate * 0.45, trackCutoff, 700 + velocity * 17300),
+      startAt
+    );
+    filter.Q.setValueAtTime(trackResonance, startAt);
+
+    const gain = this.context.createGain();
+    const gainLevel = velocity * velocity * trackVolume;
+    gain.gain.setValueAtTime(gainLevel, startAt);
+    source.connect(filter);
+    filter.connect(gain);
+    gain.connect(this.output);
+    if (this.delaySend) gain.connect(this.delaySend);
+
+    if (instrument === 3) {
+      const voice = { source, gain, gainLevel };
+      this.openHatVoices.add(voice);
+      source.onended = () => this.openHatVoices.delete(voice);
+    }
+
+    const maxOffset = Math.max(0, buffer.duration - 0.0001);
+    source.start(startAt, Math.min(Math.random() * 0.002, maxOffset));
+    return true;
+  }
+
+  chokeOpenHats(when) {
+    this.openHatVoices.forEach(({ source, gain, gainLevel }) => {
+      const parameter = gain.gain;
+      if (typeof parameter.cancelAndHoldAtTime === "function") {
+        parameter.cancelAndHoldAtTime(when);
+      } else {
+        parameter.cancelScheduledValues(when);
+        parameter.setValueAtTime(gainLevel, when);
+      }
+      parameter.linearRampToValueAtTime(0.0001, when + 0.005);
+      source.stop(when + 0.005);
+    });
+    this.openHatVoices.clear();
+  }
+}
+
 const foldCache = {};
 export function foldCurve(a) {
   const k = Math.round(a * 20);
@@ -27,6 +170,7 @@ export function createAudioEngine({
   let ctx = null, masterGain = null, perfHP = null, perfLP = null;
   let delayNode = null, delayFb = null, destStream = null, noiseBuf = null;
   const trkFilters = [], trkDlySends = [];
+  const wavDrums = new WavDrumEngine();
 
   function syncTrackChannel(i) {
     if (!ctx || !trkFilters[i]) return;
@@ -91,6 +235,7 @@ export function createAudioEngine({
       destStream = ctx.createMediaStreamDestination();
       limiter.connect(destStream);
     }
+    void wavDrums.attach(ctx, masterGain, trkDlySends[3]);
     initializeMIDI();
   }
 
@@ -348,6 +493,7 @@ export function createAudioEngine({
     const delayMs = Math.max(0, (now - ctx.currentTime) * 1000);
     if (delayMs > 4) setTimeout(() => flashPad(pIdx), delayMs);
     else requestAnimationFrame(() => flashPad(pIdx));
+    if (wavDrums.play(pIdx, vel, now, t.vol, t.cut, t.res)) return;
     const vol = t.vol * vel;
 
     // K1 ratio (0.5..8 -> tune 0.5x..2.2x), K2 mod (punch), K3 att (snap), K4 rel (decay scale), K5 cut, K6 res, K7 dly

@@ -2,10 +2,13 @@ import {
   DEFAULT_NOTE, KNOB_SPECS, PADS_INFO, PAGES, PITCH_DEFAULTS,
   PITCH_MODES, PITCH_PATTERNS, PITCH_RATES, PITCH_SPECS, PRESETS,
   STORAGE_KEY, TRACK_COLORS, WAVES, WAVE_DEFAULTS, WAVE_SPECS,
-  emptySteps, hydrateProjectState, serializeProject as serializeProjectState, tracks
+  hydrateProjectState, serializeProject as serializeProjectState, tracks
 } from "./state.js";
 import { createAudioEngine } from "./audio.js";
-import { passesProbability, swingStepDuration } from "./sequencer.js";
+import {
+  createSequencer, getChainOrder, getNextPattern, gridToTick, passesProbability,
+  tickDurationSeconds, tickToGrid, GRID_TICKS
+} from "./sequencer.js";
 import { hasWebMIDIAccess } from "./midi.js";
 import { renderSegmentDisplay } from "./ui.js";
 
@@ -13,11 +16,14 @@ import { renderSegmentDisplay } from "./ui.js";
   let recorder = null, chunks = [];
   let isPlaying = false, isOverdub = false, isRecWav = false;
   let bpm = 115, swing = 0, prob = 100;
-  let stepIdx = 0, stepTimer = null, activeTrk = 0;
+  let activeTrk = 0;
   let activePat = 0, queuedPat = null;
+  let chainEnabled = false, scaleMode = "1/16", page = 0, pageAutoFollow = true;
+  let playTick = 0;
   let pitchBend = 0, joyX = 0, joyY = 0, sustainOn = false;
 
   const activeVoices = new Map();
+  const probabilityCache = new Map();
   const sustainedNotes = new Set();
   const heldPads = new Set();
   const heldNotes = new Set();
@@ -28,7 +34,7 @@ import { renderSegmentDisplay } from "./ui.js";
   let viewBase = 48;          // prima nota mostrata dalla tastiera a schermo
   let isEraseHeld = false, didLiveErase = false, eraseHoldTimer = null;
   let isKnobDragging = false, saveDirty = false;
-  let nextNoteTime = 0, lookaheadTimer = null, lastDrawnStep = -1;
+  let lastDrawnStep = -1;
 
   let activePage = 0;
   const audio = createAudioEngine({
@@ -74,6 +80,41 @@ import { renderSegmentDisplay } from "./ui.js";
   }
 
   const currentSteps = (tIdx = activeTrk) => tracks[tIdx].patterns[activePat];
+  const visibleTick = index => gridToTick(index, scaleMode, page);
+
+  function eventMatches(event, value, trackIndex) {
+    return trackIndex === 3 ? event.instrument === value : event.note === value;
+  }
+
+  function addPatternEvent(trackIndex, tick, value, velocity = trackIndex === 3 ? 0.9 : 0.8) {
+    const events = tracks[trackIndex].patterns[activePat];
+    if (trackIndex === 0) {
+      for (let i = events.length - 1; i >= 0; i--) {
+        if (events[i].tick === tick) events.splice(i, 1);
+      }
+    } else if (events.some(event => event.tick === tick && eventMatches(event, value, trackIndex))) {
+      return;
+    }
+
+    const event = {
+      tick,
+      instrument: trackIndex === 3 ? value : "fm",
+      velocity
+    };
+    if (trackIndex !== 3) {
+      event.note = value;
+      event.gateTicks = GRID_TICKS[scaleMode] * 0.75;
+    }
+    events.push(event);
+    events.sort((a, b) => a.tick - b.tick);
+  }
+
+  function eventPassesProbability(event, trackIndex) {
+    if (event.ratchetGroup === undefined) return passesProbability(prob);
+    const key = `${activePat}:${trackIndex}:${event.ratchetGroup}`;
+    if (!probabilityCache.has(key)) probabilityCache.set(key, passesProbability(prob));
+    return probabilityCache.get(key);
+  }
 
   /* ===== Persistenza differita (zero-jitter durante Play / drag) ===== */
   let saveDebounce = null;
@@ -90,7 +131,9 @@ import { renderSegmentDisplay } from "./ui.js";
   }
 
   function serializeProject() {
-    return serializeProjectState({ bpm, swing, prob, activePat, tracks });
+    return serializeProjectState({
+      bpm, swing, prob, activePat, chainEnabled, scaleMode, page, tracks
+    });
   }
 
   function saveProjectLocal() {
@@ -98,12 +141,18 @@ import { renderSegmentDisplay } from "./ui.js";
   }
 
   function hydrateProject(data) {
-    const transport = hydrateProjectState(data, { bpm, swing, prob, activePat }, tracks);
+    const transport = hydrateProjectState(
+      data, { bpm, swing, prob, activePat, chainEnabled, scaleMode, page }, tracks
+    );
     if (!transport) return false;
     bpm = transport.bpm;
     swing = transport.swing;
     prob = transport.prob;
     activePat = transport.activePat;
+    chainEnabled = transport.chainEnabled;
+    scaleMode = transport.scaleMode;
+    page = scaleMode === "1/16" ? 0 : transport.page;
+    pageAutoFollow = true;
 
     tracks.forEach((dst, i) => {
       if (i < 3) document.getElementById(`pName${i}`).textContent = PRESETS[dst.pIdx % PRESETS.length].name;
@@ -117,7 +166,7 @@ import { renderSegmentDisplay } from "./ui.js";
     document.getElementById("swingSlider").value = swing;
     document.getElementById("probSlider").value = prob;
     for (let i = 0; i < 4; i++) audio.syncTrackChannel(i);
-    renderBpm(); renderGroove(); renderPatternBtns(); renderSteps(); armPickup();
+    renderBpm(); renderGroove(); renderPatternBtns(); renderTransportControls(); renderSteps(); armPickup();
     return true;
   }
 
@@ -178,19 +227,31 @@ import { renderSegmentDisplay } from "./ui.js";
     setTimeout(() => p.classList.remove("lit"), 110);
   }
 
-  function eraseAtStep(sIdx) {
+  function eraseAtTick(tick) {
+    const position = tickToGrid(tick, scaleMode);
+    if (!position) return;
+    const start = gridToTick(position.index, scaleMode, position.page);
+    const end = start + GRID_TICKS[scaleMode];
     let changed = false;
     if (heldPads.size > 0) {
-      const dSteps = tracks[3].patterns[activePat];
-      const before = dSteps[sIdx].length;
-      dSteps[sIdx] = dSteps[sIdx].filter(p => !heldPads.has(p));
-      if (dSteps[sIdx].length !== before) changed = true;
+      const drumEvents = tracks[3].patterns[activePat];
+      const remaining = drumEvents.filter(event =>
+        event.tick < start || event.tick >= end || !heldPads.has(event.instrument)
+      );
+      if (remaining.length !== drumEvents.length) {
+        tracks[3].patterns[activePat] = remaining;
+        changed = true;
+      }
     }
     if (heldNotes.size > 0 && activeTrk < 3) {
-      const mSteps = tracks[activeTrk].patterns[activePat];
-      const before = mSteps[sIdx].length;
-      mSteps[sIdx] = mSteps[sIdx].filter(n => !heldNotes.has(n));
-      if (mSteps[sIdx].length !== before) changed = true;
+      const noteEvents = tracks[activeTrk].patterns[activePat];
+      const remaining = noteEvents.filter(event =>
+        event.tick < start || event.tick >= end || !heldNotes.has(event.note)
+      );
+      if (remaining.length !== noteEvents.length) {
+        tracks[activeTrk].patterns[activePat] = remaining;
+        changed = true;
+      }
     }
     if (changed) {
       renderSteps();
@@ -198,7 +259,8 @@ import { renderSegmentDisplay } from "./ui.js";
     }
   }
 
-  function handleNoteOn(note, vel = 0.85, isPad = false) {
+  function handleNoteOn(note, vel = 0.85, isPad = false, timestamp = null) {
+    const eventTick = isPlaying ? tickForTimestamp(timestamp) : visibleTick(0);
     if (isPad || activeTrk === 3) {
       const rawPad = (note >= 36 && note <= 43) ? (note - 36) : (note % 8);
       const pIdx = rawPad;
@@ -207,13 +269,12 @@ import { renderSegmentDisplay } from "./ui.js";
       if (isEraseHeld && isPlaying) {
         didLiveErase = true;
         flashPad(pIdx);
-        eraseAtStep(stepIdx);
+        eraseAtTick(eventTick ?? playTick);
         return;
       }
       audio.triggerDrum(pIdx, vel);
       if (isPlaying && isOverdub) {
-        const steps = currentSteps(3);
-        if (!steps[stepIdx].includes(pIdx)) steps[stepIdx].push(pIdx);
+        addPatternEvent(3, eventTick, pIdx, vel);
         renderSteps(); scheduleSave();
       }
     } else {
@@ -223,7 +284,7 @@ import { renderSegmentDisplay } from "./ui.js";
       if (isEraseHeld && isPlaying) {
         didLiveErase = true;
         flashKey(note, true);
-        eraseAtStep(stepIdx);
+        eraseAtTick(eventTick ?? playTick);
         return;
       }
       handleNoteOff(note, true);
@@ -232,9 +293,7 @@ import { renderSegmentDisplay } from "./ui.js";
       if (v) activeVoices.set(note, v);
       requestAnimationFrame(() => flashKey(note, true));
       if (isPlaying && isOverdub) {
-        const steps = currentSteps(activeTrk);
-        if (activeTrk === 0) steps[stepIdx] = [n];
-        else if (!steps[stepIdx].includes(n)) steps[stepIdx].push(n);
+        addPatternEvent(activeTrk, eventTick, n, vel);
         renderSteps(); scheduleSave();
       }
     }
@@ -571,13 +630,50 @@ import { renderSegmentDisplay } from "./ui.js";
       const i = g * 4 + j;
       const s = document.createElement("div");
       s.className = "step"; s.textContent = i + 1;
+      const subLed = document.createElement("i");
+      subLed.className = "step-sub-led";
+      s.appendChild(subLed);
       let lpTimer = null, lpFired = false;
       const cycleRatchet = () => {
-        const t = tracks[activeTrk], steps = currentSteps(activeTrk), r = t.rat[activePat][i], f = focusElem();
-        if (f !== null) { if (!steps[i].includes(f)) steps[i].push(f); r[f] = (r[f] || 1) % 4 + 1; }
-        else { if (!steps[i].length) steps[i] = [t.last !== undefined ? t.last : DEFAULT_NOTE[activeTrk]]; const nv = Math.max(...steps[i].map(e => r[e] || 1)) % 4 + 1; steps[i].forEach(e => { r[e] = nv; }); }
-                const n = f !== null ? f : steps[i][0];
-        if (activeTrk === 3) audio.triggerDrum(n, 0.9); else audio.startVoice(activeTrk, n, 0.8, 0.14);
+        const start = visibleTick(i);
+        if (start === null) return;
+        const end = start + GRID_TICKS[scaleMode];
+        const t = tracks[activeTrk];
+        const slotEvents = t.patterns[activePat].filter(event => event.tick >= start && event.tick < end);
+        const focus = focusElem();
+        let values = focus !== null ? [focus] : [...new Set(slotEvents.map(event =>
+          activeTrk === 3 ? event.instrument : event.note
+        ))];
+        if (!values.length) values = [t.last !== undefined ? t.last : DEFAULT_NOTE[activeTrk]];
+        const sharedCount = Math.max(
+          1,
+          ...values.map(value => slotEvents.filter(event => eventMatches(event, value, activeTrk)).length)
+        ) % 4 + 1;
+
+        values.forEach(value => {
+          const matching = slotEvents.filter(event => eventMatches(event, value, activeTrk));
+          const count = focus === null ? sharedCount : (matching.length ? matching.length % 4 + 1 : 2);
+          t.patterns[activePat] = t.patterns[activePat].filter(event =>
+            event.tick < start || event.tick >= end || !eventMatches(event, value, activeTrk)
+          );
+          for (let hit = 0; hit < count; hit++) {
+            const event = {
+              tick: start + Math.round((GRID_TICKS[scaleMode] * hit) / count),
+              instrument: activeTrk === 3 ? value : "fm",
+              velocity: activeTrk === 3 ? 0.9 * (1 - 0.1 * hit) : 0.8 * (1 - 0.1 * hit),
+              ratchetGroup: `${start}:${value}`
+            };
+            if (activeTrk !== 3) {
+              event.note = value;
+              event.gateTicks = (GRID_TICKS[scaleMode] / count) * 0.8;
+            }
+            t.patterns[activePat].push(event);
+          }
+        });
+        t.patterns[activePat].sort((a, b) => a.tick - b.tick);
+        const n = values[0];
+        if (activeTrk === 3) audio.triggerDrum(n, 0.9);
+        else audio.startVoice(activeTrk, n, 0.8, 0.14);
         renderSteps(); scheduleSave();
       };
       const cancelLp = () => clearTimeout(lpTimer);
@@ -586,19 +682,32 @@ import { renderSegmentDisplay } from "./ui.js";
       s.oncontextmenu = e => e.preventDefault();
       s.onclick = () => {
         if (lpFired) { lpFired = false; return; }
+        const start = visibleTick(i);
+        if (start === null) return;
+        const end = start + GRID_TICKS[scaleMode];
         const f = focusElem();
+        const slotEvents = currentSteps(activeTrk).filter(event => event.tick >= start && event.tick < end);
         if (f !== null) {
-          const st = currentSteps(activeTrk), r = tracks[activeTrk].rat[activePat][i], k = st[i].indexOf(f);
-          if (k >= 0) { st[i].splice(k, 1); delete r[f]; }
-          else { st[i].push(f); if (activeTrk === 3) audio.triggerDrum(f, 0.9); else audio.startVoice(activeTrk, f, 0.8, 0.14); }
+          const matching = slotEvents.some(event => eventMatches(event, f, activeTrk));
+          if (matching) {
+            tracks[activeTrk].patterns[activePat] = tracks[activeTrk].patterns[activePat].filter(event =>
+              event.tick < start || event.tick >= end || !eventMatches(event, f, activeTrk)
+            );
+          } else {
+            addPatternEvent(activeTrk, start, f);
+            if (activeTrk === 3) audio.triggerDrum(f, 0.9);
+            else audio.startVoice(activeTrk, f, 0.8, 0.14);
+          }
           renderSteps(); scheduleSave(); return;
         }
-        const t = tracks[activeTrk];
-        const steps = currentSteps(activeTrk);
-        if (steps[i].length) { steps[i] = []; tracks[activeTrk].rat[activePat][i] = {}; }
+        if (slotEvents.length) {
+          tracks[activeTrk].patterns[activePat] = tracks[activeTrk].patterns[activePat].filter(event =>
+            event.tick < start || event.tick >= end
+          );
+        }
         else {
-          const n = t.last !== undefined ? t.last : DEFAULT_NOTE[activeTrk];
-          steps[i] = [n];
+          const n = tracks[activeTrk].last !== undefined ? tracks[activeTrk].last : DEFAULT_NOTE[activeTrk];
+          addPatternEvent(activeTrk, start, n);
           if (activeTrk === 3) audio.triggerDrum(n, 0.9);
           else audio.startVoice(activeTrk, n, 0.8, 0.14);
         }
@@ -617,14 +726,43 @@ import { renderSegmentDisplay } from "./ui.js";
 
   function renderSteps() {
     const steps = currentSteps(activeTrk);
-    const f = focusElem(), rat = tracks[activeTrk].rat[activePat];
+    const f = focusElem();
     stepGrid.classList.toggle("focus", f !== null);
     for (let i = 0; i < 16; i++) {
-      const el = steps[i], on = f !== null ? el.includes(f) : el.length > 0;
-      const r = on ? (f !== null ? (rat[i][f] || 1) : Math.max(...el.map(e => rat[i][e] || 1))) : 1;
+      const start = visibleTick(i);
+      const visibleEvents = start === null ? [] : steps.filter(event =>
+        event.tick >= start && event.tick < start + GRID_TICKS[scaleMode] &&
+        (f === null || eventMatches(event, f, activeTrk))
+      );
+      const on = visibleEvents.length > 0;
+      const hasSubHit = scaleMode === "1/16" &&
+        steps.some(event =>
+          event.tick >= i * 24 + 12 && event.tick < (i + 1) * 24 &&
+          (f === null || eventMatches(event, f, activeTrk))
+        );
       stepEls[i].classList.toggle("filled", on);
-      if (r > 1) stepEls[i].dataset.r = r; else delete stepEls[i].dataset.r;
+      stepEls[i].classList.toggle("sub-hit", hasSubHit);
+      const disabled = scaleMode === "1/16T" && i >= 12;
+      stepEls[i].classList.toggle("disabled", disabled);
+      stepEls[i].setAttribute("aria-disabled", String(disabled));
+      if (visibleEvents.length > 1) stepEls[i].dataset.r = visibleEvents.length; else delete stepEls[i].dataset.r;
     }
+  }
+
+  function renderTransportControls() {
+    const chainBtn = document.getElementById("chainBtn");
+    chainBtn.classList.toggle("on", chainEnabled);
+    chainBtn.setAttribute("aria-pressed", String(chainEnabled));
+    document.querySelectorAll("[data-scale-led]").forEach(led =>
+      led.classList.toggle("on", led.dataset.scaleLed === scaleMode)
+    );
+    const first = document.getElementById("pageFirstBtn");
+    const second = document.getElementById("pageSecondBtn");
+    first.classList.toggle("active", page === 0);
+    second.classList.toggle("active", page === 1);
+    first.setAttribute("aria-pressed", String(page === 0));
+    second.setAttribute("aria-pressed", String(page === 1));
+    second.disabled = scaleMode === "1/16";
   }
 
   function renderPatternBtns() {
@@ -644,6 +782,38 @@ import { renderSegmentDisplay } from "./ui.js";
     renderPatternBtns();
   }
 
+  function setPage(nextPage, manual = true) {
+    if (scaleMode === "1/16") {
+      page = 0;
+      pageAutoFollow = true;
+    } else if (manual && nextPage === page) {
+      pageAutoFollow = true;
+      const position = tickToGrid(playTick, scaleMode);
+      if (isPlaying && position) page = position.page;
+    } else {
+      page = nextPage;
+      if (manual) pageAutoFollow = false;
+    }
+    setPlayheadUI(-1);
+    renderTransportControls(); renderSteps();
+    scheduleSave();
+  }
+
+  document.getElementById("chainBtn").onclick = () => {
+    chainEnabled = !chainEnabled;
+    renderTransportControls();
+    scheduleSave();
+  };
+  document.getElementById("scaleBtn").onclick = () => {
+    const scales = ["1/16", "1/32", "1/16T"];
+    scaleMode = scales[(scales.indexOf(scaleMode) + 1) % scales.length];
+    page = 0; pageAutoFollow = true;
+    setPlayheadUI(-1);
+    renderTransportControls(); renderSteps(); scheduleSave();
+  };
+  document.getElementById("pageFirstBtn").onclick = () => setPage(0);
+  document.getElementById("pageSecondBtn").onclick = () => setPage(1);
+
   document.querySelectorAll(".pat-btn").forEach(b => {
     b.onclick = () => selectPattern(parseInt(b.dataset.pat));
   });
@@ -651,8 +821,7 @@ import { renderSegmentDisplay } from "./ui.js";
   document.getElementById("copyPatBtn").onclick = () => {
     const nextPat = (activePat + 1) % 4;
     tracks.forEach(t => {
-      t.patterns[nextPat] = t.patterns[activePat].map(s => [...s]);
-      t.rat[nextPat] = t.rat[activePat].map(o => ({ ...o }));
+      t.patterns[nextPat] = t.patterns[activePat].map(event => ({ ...event }));
     });
     activePat = nextPat; queuedPat = null;
     renderPatternBtns(); renderSteps(); scheduleSave();
@@ -721,26 +890,41 @@ import { renderSegmentDisplay } from "./ui.js";
     document.getElementById("grooveReadout").textContent = `SW ${swing}% · P ${prob}%`;
   }
 
-  /* Look-Ahead Audio Scheduler (clock hardware ctx.currentTime + UI cache O(1)) */
+  /* Playback events are dispatched from the 96 PPQN clock in sequencer.js. */
   function setPlayheadUI(idx) {
     if (lastDrawnStep >= 0 && lastDrawnStep < 16) stepEls[lastDrawnStep].classList.remove("now");
     if (idx >= 0 && idx < 16) stepEls[idx].classList.add("now");
     lastDrawnStep = idx;
   }
 
-  function scheduleStep(sIdx, when) {
-    if (sIdx === 0 && queuedPat !== null) {
-      activePat = queuedPat; queuedPat = null;
-      renderPatternBtns(); renderSteps();
-    }
+  function tickForTimestamp(timestamp) {
+    if (!isPlaying || !audio.ctx) return null;
+    const midiTime = Number.isFinite(timestamp) ? timestamp : performance.now();
+    const eventTime = audio.ctx.currentTime + (midiTime - performance.now()) / 1000;
+    return sequencer.tickAtTime(eventTime);
+  }
 
+  function advancePatternAtBar() {
+    const previousPattern = activePat;
+    if (queuedPat !== null) {
+      activePat = queuedPat;
+      queuedPat = null;
+    } else if (chainEnabled) {
+      const order = getChainOrder(tracks, activePat);
+      activePat = getNextPattern(order, activePat);
+    }
+    renderPatternBtns(); renderSteps();
+    if (activePat !== previousPattern) scheduleSave();
+  }
+
+  function scheduleTick(tick, when) {
+    if (tick === 0) probabilityCache.clear();
     if (isEraseHeld && (heldPads.size > 0 || heldNotes.size > 0)) {
       didLiveErase = true;
-      eraseAtStep(sIdx);
+      eraseAtTick(tick);
     }
 
     const baseStepSec = 60 / bpm / 4;
-
     for (let t = 0; t < 3; t++) {
       const trk = tracks[t];
       const pCnt = Math.round(trk.psteps || 1);
@@ -750,35 +934,49 @@ import { renderSegmentDisplay } from "./ui.js";
         const pDur = (60 / bpm) / rateDiv;
         gateSec = Math.max(gateSec, pDur * pCnt * 0.95);
       }
-      trk.patterns[activePat][sIdx].forEach(n => {
-        if (passesProbability(prob)) { const r = trk.rat[activePat][sIdx][n] || 1, sub = baseStepSec / r; for (let k = 0; k < r; k++) audio.startVoice(t, n, 0.8 * (1 - 0.1 * k), r > 1 ? Math.min(gateSec, sub * 0.8) : gateSec, when + k * sub); }
+      trk.patterns[activePat].forEach(event => {
+        if (event.tick !== tick || !eventPassesProbability(event, t)) return;
+        const gridGate = event.gateTicks
+          ? tickDurationSeconds(tick, bpm, swing) * event.gateTicks
+          : gateSec;
+        const eventGate = pCnt > 1 ? Math.max(gridGate, gateSec) : gridGate;
+        audio.startVoice(t, event.note, event.velocity, eventGate, when);
       });
     }
-    tracks[3].patterns[activePat][sIdx].forEach(p => {
-      if (passesProbability(prob)) { const r = tracks[3].rat[activePat][sIdx][p] || 1, sub = baseStepSec / r; for (let k = 0; k < r; k++) audio.triggerDrum(p, 0.9 * (1 - 0.1 * k), when + k * sub); }
+    tracks[3].patterns[activePat].forEach(event => {
+      if (event.tick === tick && eventPassesProbability(event, 3)) {
+        audio.triggerDrum(event.instrument, event.velocity, when);
+      }
     });
 
     const uiDelayMs = Math.max(0, (when - audio.ctx.currentTime) * 1000);
     setTimeout(() => {
       if (!isPlaying) return;
-      setPlayheadUI(sIdx);
-      if (sIdx % 4 === 0) blinkBeat();
+      playTick = tick;
+      const position = tickToGrid(tick, scaleMode);
+      if (position) {
+        if (scaleMode !== "1/16" && pageAutoFollow && page !== position.page) {
+          page = position.page;
+          renderTransportControls(); renderSteps();
+          scheduleSave();
+        }
+        if (page === position.page) {
+          if (position.index !== lastDrawnStep) setPlayheadUI(position.index);
+        } else {
+          setPlayheadUI(-1);
+        }
+      }
+      if (tick % 96 === 0) blinkBeat();
     }, uiDelayMs);
   }
 
-  function scheduler() {
-    if (!isPlaying) return;
-    const lookAheadSec = 0.08;
-    while (nextNoteTime < audio.ctx.currentTime + lookAheadSec) {
-      const curStep = stepIdx;
-      scheduleStep(curStep, nextNoteTime);
-      const baseStepSec = 60 / bpm / 4;
-      const stepDur = swingStepDuration(baseStepSec, swing, curStep);
-      nextNoteTime += Math.max(0.025, stepDur);
-      stepIdx = (stepIdx + 1) % 16;
-    }
-    lookaheadTimer = setTimeout(scheduler, 20);
-  }
+  const sequencer = createSequencer({
+    getAudioContext: () => audio.ctx,
+    getBpm: () => bpm,
+    getSwing: () => swing,
+    onBarStart: advancePatternAtBar,
+    onTick: scheduleTick
+  });
 
   document.getElementById("playBtn").onclick = () => {
     audio.initAudio();
@@ -786,12 +984,18 @@ import { renderSegmentDisplay } from "./ui.js";
     const b = document.getElementById("playBtn");
     b.classList.toggle("playing", isPlaying);
     if (isPlaying) {
-      stepIdx = 0;
-      nextNoteTime = audio.ctx.currentTime + 0.005;
-      scheduler();
+      playTick = 0;
+      const previousPattern = activePat;
+      if (chainEnabled) activePat = getChainOrder(tracks, activePat)[0];
+      if (activePat !== previousPattern) scheduleSave();
+      renderPatternBtns(); renderSteps();
+      sequencer.start();
     } else {
-      clearTimeout(lookaheadTimer);
-      if (queuedPat !== null) { activePat = queuedPat; queuedPat = null; renderPatternBtns(); renderSteps(); }
+      sequencer.stop();
+      if (queuedPat !== null) {
+        activePat = queuedPat; queuedPat = null;
+        renderPatternBtns(); renderSteps(); scheduleSave();
+      }
       setPlayheadUI(-1);
       flushSave();
     }
@@ -822,8 +1026,7 @@ import { renderSegmentDisplay } from "./ui.js";
     didLiveErase = false;
     clearBtn.classList.remove("erasing");
     if (shouldClearAll) {
-      tracks[activeTrk].patterns[activePat] = emptySteps();
-      tracks[activeTrk].rat[activePat] = Array.from({ length: 16 }, () => ({}));
+      tracks[activeTrk].patterns[activePat] = [];
       renderSteps(); scheduleSave();
     }
   };
@@ -916,7 +1119,7 @@ import { renderSegmentDisplay } from "./ui.js";
               const on = cmd === 0x90 && d2 > 0;
               const pad = profile.pads[`n${ch}:${d1}`];
               const note = pad !== undefined ? 36 + pad : d1;
-              if (on) handleNoteOn(note, d2 / 127, pad !== undefined);
+              if (on) handleNoteOn(note, d2 / 127, pad !== undefined, m.timeStamp);
               else handleNoteOff(note, false, pad !== undefined);
             } else if (cmd === 0xE0) {
               const raw = ((d2 << 7) | d1) - 8192;
@@ -929,7 +1132,8 @@ import { renderSegmentDisplay } from "./ui.js";
               if (jd !== undefined) { joyCC(jd, d2 / 127); return; }
               const pad = profile.pads[`c${ch}:${d1}`];
               if (pad !== undefined) {
-                if (d2 > 0) handleNoteOn(36 + pad, d2 / 127, true); else handleNoteOff(36 + pad, false, true);
+                if (d2 > 0) handleNoteOn(36 + pad, d2 / 127, true, m.timeStamp);
+                else handleNoteOff(36 + pad, false, true);
                 return;
               }
               const tab = profile.tabs[d1];
@@ -1082,5 +1286,6 @@ import { renderSegmentDisplay } from "./ui.js";
   window.addEventListener("visibilitychange", () => { if (document.hidden && saveDirty) saveProjectLocal(); });
   document.body.addEventListener("pointerdown", initAudio, { once: true });
   syncInputMode();
-  renderSteps(); updateKnobsUI(); applyTrackColor(0); renderBpm(); renderGroove(); renderPatternBtns();
+  renderSteps(); updateKnobsUI(); applyTrackColor(0); renderBpm(); renderGroove();
+  renderPatternBtns(); renderTransportControls();
 })();
