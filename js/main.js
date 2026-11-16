@@ -1,12 +1,12 @@
 import {
   DEFAULT_NOTE, KNOB_SPECS, PADS_INFO, PAGES, PITCH_DEFAULTS,
-  PITCH_MODES, PITCH_PATTERNS, PITCH_RATES, PITCH_SPECS, PRESETS,
+  PITCH_MODES, PITCH_PATTERNS, PITCH_SPECS, PRESETS,
   STORAGE_KEY, TRACK_COLORS, WAVES, WAVE_DEFAULTS, WAVE_SPECS,
   hydrateProjectState, serializeProject as serializeProjectState, tracks
 } from "./state.js";
 import { createAudioEngine } from "./audio.js";
 import {
-  createSequencer, getChainOrder, getNextPattern, gridToTick, passesProbability,
+  createSequencer, durationSecondsAtTick, durationTicksBetween, getChainOrder, getNextPattern, gridToTick, passesProbability,
   tickDurationSeconds, tickToGrid, GRID_TICKS
 } from "./sequencer.js";
 import { hasWebMIDIAccess } from "./midi.js";
@@ -23,11 +23,13 @@ import { renderSegmentDisplay } from "./ui.js";
   let pitchBend = 0, joyX = 0, joyY = 0, sustainOn = false;
 
   const activeVoices = new Map();
+  const recordedMidiNotes = new Map();
   const probabilityCache = new Map();
   const sustainedNotes = new Set();
   const heldPads = new Set();
   const heldNotes = new Set();
   const stepEls = new Array(16);
+  const suppressedStepClicks = new WeakSet();
   const padEls = new Array(8);
   const keyEls = new Map();   // slot 48..72 -> elemento del tasto
   const litKeys = new Map();  // nota suonata -> tasto acceso, cosi' si spegne anche se la finestra si sposta
@@ -35,6 +37,7 @@ import { renderSegmentDisplay } from "./ui.js";
   let isEraseHeld = false, didLiveErase = false, eraseHoldTimer = null;
   let isKnobDragging = false, saveDirty = false;
   let lastDrawnStep = -1;
+  let activeGatePointer = null;
 
   let activePage = 0;
   const audio = createAudioEngine({
@@ -93,7 +96,7 @@ import { renderSegmentDisplay } from "./ui.js";
         if (events[i].tick === tick) events.splice(i, 1);
       }
     } else if (events.some(event => event.tick === tick && eventMatches(event, value, trackIndex))) {
-      return;
+      return events.find(event => event.tick === tick && eventMatches(event, value, trackIndex));
     }
 
     const event = {
@@ -103,10 +106,11 @@ import { renderSegmentDisplay } from "./ui.js";
     };
     if (trackIndex !== 3) {
       event.note = value;
-      event.gateTicks = GRID_TICKS[scaleMode] * 0.75;
+      event.duration = GRID_TICKS[scaleMode];
     }
     events.push(event);
     events.sort((a, b) => a.tick - b.tick);
+    return event;
   }
 
   function eventPassesProbability(event, trackIndex) {
@@ -259,7 +263,25 @@ import { renderSegmentDisplay } from "./ui.js";
     }
   }
 
-  function handleNoteOn(note, vel = 0.85, isPad = false, timestamp = null) {
+  function finishRecordedMidiNote(key, endTick) {
+    const recorded = recordedMidiNotes.get(key);
+    if (!recorded) return;
+    recordedMidiNotes.delete(key);
+    const duration = durationTicksBetween(recorded.startTick, endTick);
+    if (duration === null) return;
+    recorded.event.duration = duration;
+    const events = tracks[recorded.trackIndex].patterns[recorded.patternIndex];
+    if (events.includes(recorded.event)) {
+      renderSteps();
+      scheduleSave();
+    }
+  }
+
+  function finalizeRecordedMidiNotes(endTick) {
+    for (const key of recordedMidiNotes.keys()) finishRecordedMidiNote(key, endTick);
+  }
+
+  function handleNoteOn(note, vel = 0.85, isPad = false, timestamp = null, midiKey = null) {
     const eventTick = isPlaying ? tickForTimestamp(timestamp) : visibleTick(0);
     if (isPad || activeTrk === 3) {
       const rawPad = (note >= 36 && note <= 43) ? (note - 36) : (note % 8);
@@ -293,13 +315,25 @@ import { renderSegmentDisplay } from "./ui.js";
       if (v) activeVoices.set(note, v);
       requestAnimationFrame(() => flashKey(note, true));
       if (isPlaying && isOverdub) {
-        addPatternEvent(activeTrk, eventTick, n, vel);
+        const event = addPatternEvent(activeTrk, eventTick, n, vel);
+        if (midiKey && event && eventTick !== null) {
+          if (recordedMidiNotes.has(midiKey)) finishRecordedMidiNote(midiKey, eventTick);
+          recordedMidiNotes.set(midiKey, {
+            trackIndex: activeTrk,
+            patternIndex: activePat,
+            event,
+            startTick: eventTick
+          });
+        }
         renderSteps(); scheduleSave();
       }
     }
   }
 
-  function handleNoteOff(note, force = false, isPad = false) {
+  function handleNoteOff(note, force = false, isPad = false, timestamp = null, midiKey = null) {
+    if (midiKey && recordedMidiNotes.has(midiKey)) {
+      finishRecordedMidiNote(midiKey, isPlaying ? tickForTimestamp(timestamp) : null);
+    }
     if (isPad || activeTrk === 3) {
       const rawPad = (note >= 36 && note <= 43) ? (note - 36) : (note % 8);
       const pIdx = rawPad;
@@ -622,6 +656,26 @@ import { renderSegmentDisplay } from "./ui.js";
   }
 
   const stepGrid = document.getElementById("stepGrid");
+
+  function getMelodicEventInStep(tick) {
+    const end = tick + GRID_TICKS[scaleMode];
+    const focus = focusElem();
+    return currentSteps().find(event =>
+      event.tick >= tick && event.tick < end &&
+      (focus === null || eventMatches(event, focus, activeTrk))
+    );
+  }
+
+  function eventCoversStep(event, start, end) {
+    if (!Number.isInteger(event.duration) || event.duration <= 0 ||
+        (event.tick >= start && event.tick < end)) return false;
+    const eventEnd = event.tick + Math.min(event.duration, 384);
+    const ranges = eventEnd <= 384
+      ? [[event.tick, eventEnd]]
+      : [[event.tick, 384], [0, eventEnd - 384]];
+    return ranges.some(([rangeStart, rangeEnd]) => end > rangeStart && start < rangeEnd);
+  }
+
   for (let g = 0; g < 4; g++) {
     const grp = document.createElement("div");
     grp.className = "step-group";
@@ -665,7 +719,7 @@ import { renderSegmentDisplay } from "./ui.js";
             };
             if (activeTrk !== 3) {
               event.note = value;
-              event.gateTicks = (GRID_TICKS[scaleMode] / count) * 0.8;
+              event.duration = Math.max(1, Math.round((GRID_TICKS[scaleMode] / count) * 0.8));
             }
             t.patterns[activePat].push(event);
           }
@@ -677,10 +731,56 @@ import { renderSegmentDisplay } from "./ui.js";
         renderSteps(); scheduleSave();
       };
       const cancelLp = () => clearTimeout(lpTimer);
-      s.onpointerdown = () => { lpFired = false; clearTimeout(lpTimer); lpTimer = setTimeout(() => { lpFired = true; cycleRatchet(); }, 300); };
-      s.onpointerup = cancelLp; s.onpointerleave = cancelLp; s.onpointercancel = cancelLp;
+      s.onpointerdown = e => {
+        lpFired = false;
+        clearTimeout(lpTimer);
+        const tick = visibleTick(i);
+        if (activeGatePointer && activeGatePointer.pointerId !== e.pointerId &&
+            activeGatePointer.trackIndex === activeTrk &&
+            activeGatePointer.patternIndex === activePat && tick !== null) {
+          const targetOffset = (tick - activeGatePointer.startTick + 384) % 384;
+          const duration = Math.min(384, targetOffset + GRID_TICKS[scaleMode]);
+          if (duration > activeGatePointer.event.duration) {
+            activeGatePointer.event.duration = duration;
+            activeGatePointer.handled = true;
+            renderSteps();
+            scheduleSave();
+          }
+          suppressedStepClicks.add(activeGatePointer.element);
+          suppressedStepClicks.add(s);
+          return;
+        }
+
+        if (activeTrk < 3 && tick !== null) {
+          const event = getMelodicEventInStep(tick);
+          if (event) {
+            activeGatePointer = {
+              pointerId: e.pointerId,
+              element: s,
+              event,
+              startTick: event.tick,
+              trackIndex: activeTrk,
+              patternIndex: activePat
+            };
+          }
+        }
+        if (!activeGatePointer || activeGatePointer.pointerId !== e.pointerId) {
+          lpTimer = setTimeout(() => { lpFired = true; cycleRatchet(); }, 300);
+        }
+      };
+      const releaseStepPointer = e => {
+        cancelLp();
+        if (activeGatePointer?.pointerId === e.pointerId) activeGatePointer = null;
+      };
+      s.onpointerup = releaseStepPointer;
+      s.onpointerleave = cancelLp;
+      s.onpointercancel = releaseStepPointer;
       s.oncontextmenu = e => e.preventDefault();
       s.onclick = () => {
+        if (suppressedStepClicks.has(s)) {
+          suppressedStepClicks.delete(s);
+          return;
+        }
         if (lpFired) { lpFired = false; return; }
         const start = visibleTick(i);
         if (start === null) return;
@@ -740,8 +840,13 @@ import { renderSegmentDisplay } from "./ui.js";
           event.tick >= i * 24 + 12 && event.tick < (i + 1) * 24 &&
           (f === null || eventMatches(event, f, activeTrk))
         );
+      const hasGateCoverage = activeTrk < 3 && start !== null && steps.some(event =>
+        (f === null || eventMatches(event, f, activeTrk)) &&
+        eventCoversStep(event, start, start + GRID_TICKS[scaleMode])
+      );
       stepEls[i].classList.toggle("filled", on);
       stepEls[i].classList.toggle("sub-hit", hasSubHit);
+      stepEls[i].classList.toggle("gate-covered", hasGateCoverage);
       const disabled = scaleMode === "1/16T" && i >= 12;
       stepEls[i].classList.toggle("disabled", disabled);
       stepEls[i].setAttribute("aria-disabled", String(disabled));
@@ -924,23 +1029,13 @@ import { renderSegmentDisplay } from "./ui.js";
       eraseAtTick(tick);
     }
 
-    const baseStepSec = 60 / bpm / 4;
     for (let t = 0; t < 3; t++) {
       const trk = tracks[t];
-      const pCnt = Math.round(trk.psteps || 1);
-      let gateSec = baseStepSec * 0.75;
-      if (pCnt > 1) {
-        const rateDiv = PITCH_RATES[Math.round(trk.prate !== undefined ? trk.prate : 3)].div;
-        const pDur = (60 / bpm) / rateDiv;
-        gateSec = Math.max(gateSec, pDur * pCnt * 0.95);
-      }
       trk.patterns[activePat].forEach(event => {
         if (event.tick !== tick || !eventPassesProbability(event, t)) return;
-        const gridGate = event.gateTicks
-          ? tickDurationSeconds(tick, bpm, swing) * event.gateTicks
-          : gateSec;
-        const eventGate = pCnt > 1 ? Math.max(gridGate, gateSec) : gridGate;
-        audio.startVoice(t, event.note, event.velocity, eventGate, when);
+        const duration = Number.isInteger(event.duration) ? event.duration : 24;
+        const gateSeconds = durationSecondsAtTick(event.tick, duration, bpm, swing);
+        audio.startVoice(t, event.note, event.velocity, gateSeconds, when);
       });
     }
     tracks[3].patterns[activePat].forEach(event => {
@@ -980,6 +1075,7 @@ import { renderSegmentDisplay } from "./ui.js";
 
   document.getElementById("playBtn").onclick = () => {
     audio.initAudio();
+    if (isPlaying) finalizeRecordedMidiNotes(tickForTimestamp());
     isPlaying = !isPlaying;
     const b = document.getElementById("playBtn");
     b.classList.toggle("playing", isPlaying);
@@ -1119,8 +1215,9 @@ import { renderSegmentDisplay } from "./ui.js";
               const on = cmd === 0x90 && d2 > 0;
               const pad = profile.pads[`n${ch}:${d1}`];
               const note = pad !== undefined ? 36 + pad : d1;
-              if (on) handleNoteOn(note, d2 / 127, pad !== undefined, m.timeStamp);
-              else handleNoteOff(note, false, pad !== undefined);
+              const midiKey = `${input.id || input.name}:${ch}:${d1}`;
+              if (on) handleNoteOn(note, d2 / 127, pad !== undefined, m.timeStamp, midiKey);
+              else handleNoteOff(note, false, pad !== undefined, m.timeStamp, midiKey);
             } else if (cmd === 0xE0) {
               const raw = ((d2 << 7) | d1) - 8192;
               joyX = raw / 8192;

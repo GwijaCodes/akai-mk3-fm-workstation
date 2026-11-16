@@ -144,9 +144,10 @@ export function hydrateProjectState(data, transport, targetTracks) {
     });
     if (Array.isArray(src.patterns) && src.patterns.length === 4) {
       if (data.version >= 2 || data.ppqn === 96) {
+        const defaultDuration = { "1/16": 24, "1/32": 12, "1/16T": 16 }[nextTransport.scaleMode] || 24;
         dst.patterns = src.patterns.map(pattern => {
           if (!Array.isArray(pattern)) return [];
-          return pattern.map(copyPatternEvent).filter(event =>
+          return pattern.map(event => copyPatternEvent(event, i < 3 ? defaultDuration : null)).filter(event =>
             event && (i === 3
               ? Number.isInteger(event.instrument) && event.instrument >= 0 && event.instrument < 8
               : typeof event.instrument === "string" && Number.isInteger(event.note))
@@ -167,11 +168,21 @@ export function hydrateProjectState(data, transport, targetTracks) {
   return nextTransport;
 }
 
-function copyPatternEvent(event) {
+function copyPatternEvent(event, defaultDuration = null) {
   if (!event || !Number.isInteger(event.tick) || event.tick < 0 || event.tick >= 384) return null;
   if (!Number.isFinite(event.velocity) || event.velocity < 0 || event.velocity > 1) return null;
   if (!(typeof event.instrument === "string" || Number.isInteger(event.instrument))) return null;
-  return { ...event };
+  const copy = { ...event };
+  if (defaultDuration !== null) {
+    const duration = Number.isInteger(copy.duration) && copy.duration > 0
+      ? copy.duration
+      : Number.isFinite(copy.gateTicks) && copy.gateTicks > 0
+        ? Math.round(copy.gateTicks)
+        : defaultDuration;
+    copy.duration = Math.max(1, Math.min(384, duration));
+    delete copy.gateTicks;
+  }
+  return copy;
 }
 
 function migrateLegacyPattern(steps, ratchets, trackIndex) {
@@ -189,10 +200,14 @@ function migrateLegacyPattern(steps, ratchets, trackIndex) {
           instrument: trackIndex === 3 ? instrumentValue : "fm",
           velocity: (trackIndex === 3 ? 0.9 : 0.8) * (1 - 0.1 * hit)
         };
-        if (trackIndex !== 3) event.note = instrumentValue;
+        if (trackIndex !== 3) {
+          event.note = instrumentValue;
+          event.duration = Math.max(1, Math.round(
+            safeCount > 1 ? (24 / safeCount) * 0.8 : 24
+          ));
+        }
         if (safeCount > 1) {
           event.ratchetGroup = `${stepIndex * 24}:${instrumentValue}`;
-          if (trackIndex !== 3) event.gateTicks = (24 / safeCount) * 0.8;
         }
         events.push(event);
       }

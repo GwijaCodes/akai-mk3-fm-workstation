@@ -244,6 +244,11 @@ input[type="range"]::-moz-range-thumb {
   background: linear-gradient(180deg, var(--c-hi), var(--c)); color: rgba(0, 0, 0, 0.55);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), 0 0 6px -1px var(--c-glow);
 }
+.step.gate-covered {
+  background: linear-gradient(180deg, var(--c-soft), rgba(48, 50, 59, 0.72));
+  box-shadow: inset 0 0 0 1px var(--c-soft), 0 0 4px -1px var(--c-soft);
+  color: #c4c7cf;
+}
 .step.now {
   z-index: 1; background: linear-gradient(180deg, var(--c-soft), #30323b); color: #fff;
   box-shadow: 0 0 10px 2px var(--c-glow), inset 0 0 4px var(--c-soft);

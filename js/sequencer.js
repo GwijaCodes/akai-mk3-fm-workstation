@@ -56,6 +56,26 @@ export function tickDurationSeconds(tick, bpm, swing) {
   return stepDuration / GRID_TICKS["1/16"];
 }
 
+export function durationSecondsAtTick(startTick, duration, bpm, swing) {
+  if (!Number.isInteger(startTick) || startTick < 0 || startTick >= TICKS_PER_BAR ||
+      !Number.isInteger(duration) || duration < 1) {
+    return 0;
+  }
+  let seconds = 0;
+  for (let offset = 0; offset < duration; offset++) {
+    seconds += tickDurationSeconds((startTick + offset) % TICKS_PER_BAR, bpm, swing);
+  }
+  return seconds;
+}
+
+export function durationTicksBetween(startTick, endTick) {
+  if (!Number.isInteger(startTick) || startTick < 0 || startTick >= TICKS_PER_BAR ||
+      !Number.isInteger(endTick) || endTick < 0 || endTick >= TICKS_PER_BAR) {
+    return null;
+  }
+  return Math.max(1, (endTick - startTick + TICKS_PER_BAR) % TICKS_PER_BAR);
+}
+
 export function tickOffsetSeconds(tick, bpm, swing) {
   let seconds = 0;
   for (let i = 0; i < tick; i++) seconds += tickDurationSeconds(i, bpm, swing);
